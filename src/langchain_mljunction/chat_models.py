@@ -36,7 +36,14 @@ def _message(message: BaseMessage) -> dict[str, Any]:
             "tool_call_id": message.tool_call_id,
         }
     if isinstance(message, AIMessage):
-        value: dict[str, Any] = {"role": "assistant", "content": message.content or None}
+        content: Any = message.content or None
+        reasoning_blocks = message.additional_kwargs.get("reasoning_blocks") or []
+        if reasoning_blocks:
+            text_blocks = (
+                [{"type": "text", "text": content}] if isinstance(content, str) and content else []
+            )
+            content = [*reasoning_blocks, *text_blocks]
+        value: dict[str, Any] = {"role": "assistant", "content": content}
         if message.tool_calls:
             value["tool_calls"] = [
                 {
@@ -54,6 +61,11 @@ def _message(message: BaseMessage) -> dict[str, Any]:
 
 
 def _ai_message(body: dict[str, Any]) -> AIMessage:
+    reasoning_blocks = [
+        item.get("reasoning")
+        for item in body.get("output", [])
+        if item.get("type") == "reasoning" and item.get("reasoning")
+    ]
     texts = [
         item.get("text", "")
         if item["type"] == "text"
@@ -80,6 +92,7 @@ def _ai_message(body: dict[str, Any]) -> AIMessage:
     return AIMessage(
         content="".join(texts),
         tool_calls=calls,
+        additional_kwargs={"reasoning_blocks": reasoning_blocks},
         usage_metadata={
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),
@@ -96,11 +109,7 @@ def _ai_message(body: dict[str, Any]) -> AIMessage:
             "task_id": body.get("task_id"),
             "task_name": body.get("task_name"),
             "app_name": body.get("app_name"),
-            "reasoning": [
-                item.get("reasoning")
-                for item in body.get("output", [])
-                if item.get("type") == "reasoning"
-            ],
+            "reasoning": reasoning_blocks,
         },
     )
 
@@ -118,8 +127,19 @@ class ChatMLJunction(BaseChatModel):
     )
     timeout: float = 120
     temperature: float | None = None
+    top_p: float | None = None
+    seed: int | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
     max_tokens: int | None = None
+    reasoning: dict[str, Any] = Field(default_factory=dict)
+    output: dict[str, Any] = Field(default_factory=dict)
+    requirements: dict[str, Any] = Field(default_factory=dict)
     routing: dict[str, Any] = Field(default_factory=dict)
+    context: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = None
+    compatibility: dict[str, Any] = Field(default_factory=dict)
     session_id: str | None = None
     session_name: str | None = None
     task_id: str | None = None
@@ -144,7 +164,7 @@ class ChatMLJunction(BaseChatModel):
 
     @property
     def _identifying_params(self) -> dict[str, Any]:
-        return {"model": self.model, "base_url": self.base_url}
+        return {"model": self.model, "base_url": self.base_url, "routing": self.routing}
 
     def _get_ls_params(self, stop: list[str] | None = None, **kwargs: Any) -> LangSmithParams:
         return LangSmithParams(
@@ -163,15 +183,34 @@ class ChatMLJunction(BaseChatModel):
             "model": self.model,
             "messages": [_message(message) for message in messages],
             "stream": stream,
-            "sampling": {"temperature": self.temperature, "stop": stop},
-            "output": {"max_tokens": self.max_tokens},
+            "sampling": {
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "seed": self.seed,
+                "frequency_penalty": self.frequency_penalty,
+                "presence_penalty": self.presence_penalty,
+                "stop": stop,
+            },
+            "reasoning": self.reasoning,
+            "output": {**self.output, "max_tokens": self.max_tokens},
+            "requirements": self.requirements,
             "routing": self.routing,
+            "context": self.context,
+            "metadata": self.metadata,
+            "idempotency_key": self.idempotency_key,
             "session_id": self.session_id,
             "session_name": self.session_name,
             "task_id": self.task_id,
             "task_name": self.task_name,
-            **self.model_kwargs,
-            **kwargs,
+            "compatibility": self.compatibility,
+        }
+        payload.update(self.model_kwargs)
+        payload.update(kwargs)
+        payload["sampling"] = {
+            key: value for key, value in payload.get("sampling", {}).items() if value is not None
+        }
+        payload["output"] = {
+            key: value for key, value in payload.get("output", {}).items() if value is not None
         }
         return {key: value for key, value in payload.items() if value is not None}
 
@@ -317,3 +356,11 @@ class ChatMLJunction(BaseChatModel):
             **kwargs,
         )
         return runnable if include_raw else runnable | parser
+
+    def close(self) -> None:
+        """Close the synchronous transport owned by this model."""
+        self._client.close()
+
+    async def aclose(self) -> None:
+        """Close the asynchronous transport owned by this model."""
+        await self._client.aclose()

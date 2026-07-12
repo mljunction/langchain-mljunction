@@ -1,6 +1,13 @@
+import base64
+import struct
+
+import httpx
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
+from langchain_mljunction._client import MLJunctionAPIError, _raise_for_status
 from langchain_mljunction.chat_models import ChatMLJunction, _ai_message, _message
+from langchain_mljunction.embeddings import MLJunctionEmbeddings
 
 
 def test_message_conversion_preserves_tool_calls() -> None:
@@ -29,8 +36,66 @@ def test_native_response_conversion_preserves_usage_and_receipt() -> None:
     assert converted.response_metadata["receipt"]["actual_charge_usd"] == 0.1
 
 
+def test_reasoning_blocks_round_trip_without_becoming_text() -> None:
+    block = {"type": "thinking", "thinking": "private", "signature": "opaque"}
+    converted = _ai_message(
+        {
+            "id": "resp_1",
+            "model": "claude-test",
+            "output": [
+                {"type": "reasoning", "reasoning": block},
+                {"type": "text", "text": "answer"},
+            ],
+        }
+    )
+    assert converted.content == "answer"
+    assert _message(converted)["content"] == [block, {"type": "text", "text": "answer"}]
+
+
 def test_payload_uses_native_routing_controls() -> None:
-    model = ChatMLJunction(model="test-model", api_key="test-key", routing={"strategy": "latency"})
+    model = ChatMLJunction(
+        model="test-model",
+        api_key="test-key",
+        routing={"strategy": "latency", "require_zdr": True},
+        reasoning={"enabled": True, "effort": "high"},
+        requirements={"tools": "preferred"},
+        context={"mode": "strict"},
+        metadata={"trace": "abc"},
+        idempotency_key="idem-1",
+        top_p=0.8,
+        seed=7,
+    )
     payload = model._payload([HumanMessage(content="hello")], stream=False, stop=None)
-    assert payload["routing"] == {"strategy": "latency"}
+    assert payload["routing"] == {"strategy": "latency", "require_zdr": True}
     assert payload["messages"] == [{"role": "user", "content": "hello"}]
+    assert payload["reasoning"]["effort"] == "high"
+    assert payload["requirements"]["tools"] == "preferred"
+    assert payload["context"]["mode"] == "strict"
+    assert payload["metadata"] == {"trace": "abc"}
+    assert payload["idempotency_key"] == "idem-1"
+    assert payload["sampling"]["top_p"] == 0.8
+    assert payload["sampling"]["seed"] == 7
+
+
+def test_structured_transport_error_preserves_gateway_details() -> None:
+    response = httpx.Response(
+        400,
+        headers={"x-request-id": "resp_1"},
+        json={
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_request",
+                "message": "bad route",
+                "details": {"reason": "opaque_reasoning_provider_mismatch"},
+            }
+        },
+    )
+    with pytest.raises(MLJunctionAPIError) as exc_info:
+        _raise_for_status(response)
+    assert exc_info.value.request_id == "resp_1"
+    assert exc_info.value.details["reason"] == "opaque_reasoning_provider_mismatch"
+
+
+def test_base64_embedding_is_decoded_to_langchain_float_vector() -> None:
+    encoded = base64.b64encode(struct.pack("<2f", 1.25, -2.5)).decode()
+    assert MLJunctionEmbeddings._vector(encoded) == [1.25, -2.5]
