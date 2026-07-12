@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/assets/mljunction-langchain.svg" alt="ML Junction for LangChain" width="100%"></p>
+<p align="center"><img src="docs/assets/readme-hero.png" alt="langchain-mljunction - LangChain, routed" width="100%"></p>
 
 # langchain-mljunction
 
