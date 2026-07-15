@@ -59,9 +59,12 @@ llm = ChatMLJunction(
 )
 ```
 
-Signed Anthropic thinking blocks are retained in `AIMessage.additional_kwargs` and replayed as
-opaque blocks on the next turn. The gateway independently prevents those blocks from crossing to
-a non-Anthropic or non-continuity-capable route.
+Provider-native reasoning details are retained in
+`AIMessage.additional_kwargs["reasoning_details"]` and replayed on that exact assistant message.
+The encrypted `gwrt_v3` routing token is retained in `response_metadata["reasoning"]` and is
+automatically supplied with the next full message history. Pass
+`reasoning={"continuation_token": None}` to intentionally abandon replay for a fork. The token
+contains routing affinity only; it does not contain conversation history, reasoning, or credentials.
 
 ## Tools, structured output, and streaming
 

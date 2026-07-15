@@ -3,7 +3,7 @@ import struct
 
 import httpx
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from langchain_mljunction._client import MLJunctionAPIError, _raise_for_status
 from langchain_mljunction.chat_models import ChatMLJunction, _ai_message, _message
@@ -36,20 +36,73 @@ def test_native_response_conversion_preserves_usage_and_receipt() -> None:
     assert converted.response_metadata["receipt"]["actual_charge_usd"] == 0.1
 
 
-def test_reasoning_blocks_round_trip_without_becoming_text() -> None:
-    block = {"type": "thinking", "thinking": "private", "signature": "opaque"}
+def test_reasoning_details_and_token_round_trip_without_becoming_text() -> None:
+    block = {"type": "reasoning", "encrypted_content": "opaque"}
     converted = _ai_message(
         {
             "id": "resp_1",
             "model": "claude-test",
-            "output": [
-                {"type": "reasoning", "reasoning": block},
-                {"type": "text", "text": "answer"},
-            ],
+            "output": [{"type": "text", "text": "answer"}],
+            "reasoning": {
+                "details": [block],
+                "continuation_token": "gwrt_v3.a-valid-long-token",
+                "phase": "completed",
+                "reusable": True,
+            },
         }
     )
     assert converted.content == "answer"
-    assert _message(converted)["content"] == [block, {"type": "text", "text": "answer"}]
+    assert _message(converted) == {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_details": [block],
+    }
+
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+    payload = model._payload(
+        [HumanMessage(content="first"), converted, HumanMessage(content="continue")],
+        stream=False,
+        stop=None,
+    )
+    assert payload["reasoning"]["continuation_token"] == "gwrt_v3.a-valid-long-token"
+
+
+def test_explicit_null_continuation_disables_automatic_replay() -> None:
+    previous = AIMessage(
+        content="answer",
+        response_metadata={
+            "reasoning": {"continuation_token": "gwrt_v3.a-valid-long-token"}
+        },
+    )
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+    payload = model._payload(
+        [HumanMessage(content="first"), previous, HumanMessage(content="fork")],
+        stream=False,
+        stop=None,
+        reasoning={"enabled": True, "continuation_token": None},
+    )
+    assert payload["reasoning"]["continuation_token"] is None
+
+
+def test_tool_result_continuation_sets_input_type() -> None:
+    previous = AIMessage(
+        content="",
+        tool_calls=[{"name": "weather", "args": {}, "id": "call_1"}],
+        response_metadata={
+            "reasoning": {"continuation_token": "gwrt_v3.a-valid-long-token"}
+        },
+    )
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+    payload = model._payload(
+        [
+            HumanMessage(content="weather?"),
+            previous,
+            ToolMessage(content="sunny", tool_call_id="call_1"),
+        ],
+        stream=False,
+        stop=None,
+    )
+    assert payload["reasoning"]["input_type"] == "tool_results"
 
 
 def test_payload_uses_native_routing_controls() -> None:

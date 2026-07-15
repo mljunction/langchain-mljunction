@@ -37,13 +37,10 @@ def _message(message: BaseMessage) -> dict[str, Any]:
         }
     if isinstance(message, AIMessage):
         content: Any = message.content or None
-        reasoning_blocks = message.additional_kwargs.get("reasoning_blocks") or []
-        if reasoning_blocks:
-            text_blocks = (
-                [{"type": "text", "text": content}] if isinstance(content, str) and content else []
-            )
-            content = [*reasoning_blocks, *text_blocks]
         value: dict[str, Any] = {"role": "assistant", "content": content}
+        reasoning_details = message.additional_kwargs.get("reasoning_details") or []
+        if reasoning_details:
+            value["reasoning_details"] = reasoning_details
         if message.tool_calls:
             value["tool_calls"] = [
                 {
@@ -61,7 +58,8 @@ def _message(message: BaseMessage) -> dict[str, Any]:
 
 
 def _ai_message(body: dict[str, Any]) -> AIMessage:
-    reasoning_blocks = [
+    reasoning = body.get("reasoning") or {}
+    reasoning_details = reasoning.get("details") or [
         item.get("reasoning")
         for item in body.get("output", [])
         if item.get("type") == "reasoning" and item.get("reasoning")
@@ -92,7 +90,7 @@ def _ai_message(body: dict[str, Any]) -> AIMessage:
     return AIMessage(
         content="".join(texts),
         tool_calls=calls,
-        additional_kwargs={"reasoning_blocks": reasoning_blocks},
+        additional_kwargs={"reasoning_details": reasoning_details},
         usage_metadata={
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),
@@ -109,9 +107,20 @@ def _ai_message(body: dict[str, Any]) -> AIMessage:
             "task_id": body.get("task_id"),
             "task_name": body.get("task_name"),
             "app_name": body.get("app_name"),
-            "reasoning": reasoning_blocks,
+            "reasoning": reasoning,
         },
     )
+
+
+def _latest_continuation_token(messages: list[BaseMessage]) -> str | None:
+    for message in reversed(messages):
+        if not isinstance(message, AIMessage):
+            continue
+        reasoning = message.response_metadata.get("reasoning") or {}
+        token = reasoning.get("continuation_token")
+        if isinstance(token, str) and token:
+            return token
+    return None
 
 
 class ChatMLJunction(BaseChatModel):
@@ -206,6 +215,19 @@ class ChatMLJunction(BaseChatModel):
         }
         payload.update(self.model_kwargs)
         payload.update(kwargs)
+        reasoning = dict(payload.get("reasoning") or {})
+        if "continuation_token" not in reasoning:
+            token = _latest_continuation_token(messages)
+            if token is not None:
+                reasoning["continuation_token"] = token
+        if (
+            reasoning.get("continuation_token")
+            and "input_type" not in reasoning
+            and messages
+            and isinstance(messages[-1], ToolMessage)
+        ):
+            reasoning["input_type"] = "tool_results"
+        payload["reasoning"] = reasoning
         payload["sampling"] = {
             key: value for key, value in payload.get("sampling", {}).items() if value is not None
         }
