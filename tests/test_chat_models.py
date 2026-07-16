@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import struct
 
@@ -5,7 +6,11 @@ import httpx
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from langchain_mljunction._client import MLJunctionAPIError, _raise_for_status
+from langchain_mljunction._client import (
+    MLJunctionAPIError,
+    _araise_for_status,
+    _raise_for_status,
+)
 from langchain_mljunction.chat_models import ChatMLJunction, _ai_message, _message
 from langchain_mljunction.embeddings import MLJunctionEmbeddings
 
@@ -105,6 +110,28 @@ def test_tool_result_continuation_sets_input_type() -> None:
     assert payload["reasoning"]["input_type"] == "tool_results"
 
 
+def test_tool_result_continuation_survives_trailing_workflow_context() -> None:
+    previous = AIMessage(
+        content="",
+        tool_calls=[{"name": "weather", "args": {}, "id": "call_1"}],
+        response_metadata={
+            "reasoning": {"continuation_token": "gwrt_v3.a-valid-long-token"}
+        },
+    )
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+    payload = model._payload(
+        [
+            HumanMessage(content="weather?"),
+            previous,
+            ToolMessage(content="sunny", tool_call_id="call_1"),
+            HumanMessage(content="Current workflow state: enquiry complete"),
+        ],
+        stream=False,
+        stop=None,
+    )
+    assert payload["reasoning"]["input_type"] == "tool_results"
+
+
 def test_payload_uses_native_routing_controls() -> None:
     model = ChatMLJunction(
         model="test-model",
@@ -146,6 +173,37 @@ def test_bind_tools_forwards_parallel_control_as_native_field() -> None:
     assert "compatibility" not in bound.kwargs
 
 
+def test_structured_json_stream_produces_a_langchain_generation() -> None:
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+    model._client.stream = lambda *_args, **_kwargs: iter(
+        [("response.output_json.done", {"object": {"ok": True}})]
+    )
+
+    chunks = list(model._stream([HumanMessage(content="Return JSON")]))
+
+    assert len(chunks) == 1
+    assert chunks[0].message.content == '{"ok":true}'
+
+
+@pytest.mark.asyncio
+async def test_async_structured_json_stream_produces_a_langchain_generation() -> None:
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+
+    async def events():
+        yield "response.output_json.done", {"object": {"ok": True}}
+        await asyncio.sleep(0)
+
+    model._client.astream = lambda *_args, **_kwargs: events()
+
+    chunks = [
+        chunk
+        async for chunk in model._astream([HumanMessage(content="Return JSON")])
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0].message.content == '{"ok":true}'
+
+
 def test_structured_transport_error_preserves_gateway_details() -> None:
     response = httpx.Response(
         400,
@@ -163,6 +221,24 @@ def test_structured_transport_error_preserves_gateway_details() -> None:
         _raise_for_status(response)
     assert exc_info.value.request_id == "resp_1"
     assert exc_info.value.details["reason"] == "opaque_reasoning_provider_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_async_streaming_transport_error_is_read_before_parsing() -> None:
+    response = httpx.Response(
+        400,
+        headers={"x-request-id": "resp_stream_1"},
+        stream=httpx.ByteStream(
+            b'{"error":{"code":"invalid_request","message":"bad streamed request"}}'
+        ),
+    )
+
+    with pytest.raises(MLJunctionAPIError) as exc_info:
+        await _araise_for_status(response)
+
+    assert exc_info.value.request_id == "resp_stream_1"
+    assert exc_info.value.code == "invalid_request"
+    assert "bad streamed request" in str(exc_info.value)
 
 
 def test_base64_embedding_is_decoded_to_langchain_float_vector() -> None:

@@ -123,6 +123,20 @@ def _latest_continuation_token(messages: list[BaseMessage]) -> str | None:
     return None
 
 
+def _has_tool_result_after_latest_assistant(messages: list[BaseMessage]) -> bool:
+    latest_assistant_index: int | None = None
+    for index in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[index], AIMessage):
+            latest_assistant_index = index
+            break
+    if latest_assistant_index is None:
+        return False
+    return any(
+        isinstance(message, ToolMessage)
+        for message in messages[latest_assistant_index + 1 :]
+    )
+
+
 class ChatMLJunction(BaseChatModel):
     """Native LangChain chat model for ML Junction's rich Responses API."""
 
@@ -223,8 +237,7 @@ class ChatMLJunction(BaseChatModel):
         if (
             reasoning.get("continuation_token")
             and "input_type" not in reasoning
-            and messages
-            and isinstance(messages[-1], ToolMessage)
+            and _has_tool_result_after_latest_assistant(messages)
         ):
             reasoning["input_type"] = "tool_results"
         payload["reasoning"] = reasoning
@@ -277,6 +290,14 @@ class ChatMLJunction(BaseChatModel):
         for event, data in events:
             if event == "response.output_text.delta":
                 message = AIMessageChunk(content=data.get("delta", ""))
+            elif event == "response.output_json.done":
+                message = AIMessageChunk(
+                    content=json.dumps(
+                        data.get("object"),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
             elif event == "response.tool_call.delta":
                 message = AIMessageChunk(
                     content="",
@@ -310,6 +331,14 @@ class ChatMLJunction(BaseChatModel):
         async for event, data in events:
             if event == "response.output_text.delta":
                 message = AIMessageChunk(content=data.get("delta", ""))
+            elif event == "response.output_json.done":
+                message = AIMessageChunk(
+                    content=json.dumps(
+                        data.get("object"),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
             elif event == "response.tool_call.delta":
                 message = AIMessageChunk(
                     content="",

@@ -31,6 +31,15 @@ class MLJunctionAPIError(RuntimeError):
 
 def _raise_for_status(response: httpx.Response) -> None:
     if response.is_error:
+        if not response.is_closed:
+            response.read()
+        raise MLJunctionAPIError(response)
+
+
+async def _araise_for_status(response: httpx.Response) -> None:
+    if response.is_error:
+        if not response.is_closed:
+            await response.aread()
         raise MLJunctionAPIError(response)
 
 
@@ -67,7 +76,7 @@ class MLJunctionClient:
         self, path: str, payload: dict[str, Any]
     ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
         async with self.async_.stream("POST", path, json=payload) as response:
-            _raise_for_status(response)
+            await _araise_for_status(response)
             event: str | None = None
             data: list[str] = []
             async for line in response.aiter_lines():
