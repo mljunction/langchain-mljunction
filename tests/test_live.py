@@ -1,3 +1,4 @@
+import json
 import os
 
 import pytest
@@ -22,7 +23,7 @@ def test_native_langchain_invoke_stream_tools_and_structured_output() -> None:
         model=os.getenv("LIVE_OPENAI_MODEL", "gpt-4o-mini"),
         api_key=KEY,
         base_url=os.getenv("LIVE_API_BASE", "http://localhost:8001"),
-        max_tokens=64,
+        max_tokens=512,
         routing={"strategy": "latency"},
         session_id="langchain-live",
         session_name="LangChain session",
@@ -51,9 +52,70 @@ def test_native_langchain_invoke_stream_tools_and_structured_output() -> None:
         tool_choice="required",
     )
     assert tool_model.invoke("Use multiply for 7 times 8").tool_calls
+    streamed_tool_chunks = list(tool_model.stream("Use multiply for 9 times 6"))
+    assert any(chunk.tool_call_chunks for chunk in streamed_tool_chunks)
+
+    parallel_model = model.bind_tools(
+        [
+            {
+                "name": "add",
+                "description": "Add numbers",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                    "required": ["a", "b"],
+                },
+            },
+            {
+                "name": "multiply",
+                "description": "Multiply numbers",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
+                    "required": ["a", "b"],
+                },
+            },
+        ],
+        tool_choice="required",
+        parallel_tool_calls=True,
+    )
+    parallel = parallel_model.invoke(
+        "Call add for 2+3 and multiply for 4*5 in the same turn."
+    )
+    assert {call["name"] for call in parallel.tool_calls} == {"add", "multiply"}
 
     place = model.with_structured_output(Place).invoke("Return Paris, France")
     assert place.city and place.country
+
+    structured_stream = model.bind(
+        output={
+            "streaming_mode": "raw_compat",
+            "format": {
+                "type": "json_schema",
+                "name": "checks",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "checks": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 8,
+                            "maxItems": 8,
+                        }
+                    },
+                    "required": ["checks"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    )
+    structured_chunks = list(
+        structured_stream.stream("Return exactly eight detailed API reliability checks.")
+    )
+    structured = json.loads("".join(chunk.content for chunk in structured_chunks))
+    assert len(structured["checks"]) == 8
+    assert len([chunk for chunk in structured_chunks if chunk.content]) > 1
 
 
 async def test_native_langchain_async_and_embeddings() -> None:
@@ -61,7 +123,7 @@ async def test_native_langchain_async_and_embeddings() -> None:
         model=os.getenv("LIVE_OPENAI_MODEL", "gpt-4o-mini"),
         api_key=KEY,
         base_url=os.getenv("LIVE_API_BASE", "http://localhost:8001"),
-        max_tokens=16,
+        max_tokens=64,
     )
     response = await model.ainvoke("Reply only OK")
     assert response.content

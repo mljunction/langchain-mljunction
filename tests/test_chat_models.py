@@ -130,6 +130,22 @@ def test_payload_uses_native_routing_controls() -> None:
     assert payload["sampling"]["seed"] == 7
 
 
+def test_bind_tools_forwards_parallel_control_as_native_field() -> None:
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+    bound = model.bind_tools(
+        [
+            {
+                "name": "add",
+                "description": "Add values",
+                "parameters": {"type": "object"},
+            }
+        ],
+        parallel_tool_calls=True,
+    )
+    assert bound.kwargs["parallel_tool_calls"] is True
+    assert "compatibility" not in bound.kwargs
+
+
 def test_structured_transport_error_preserves_gateway_details() -> None:
     response = httpx.Response(
         400,

@@ -349,7 +349,7 @@ class ChatMLJunction(BaseChatModel):
         return self.bind(
             tools=formatted,
             tool_choice=tool_choice,
-            compatibility={"parallel_tool_calls": parallel_tool_calls},
+            parallel_tool_calls=parallel_tool_calls,
             **kwargs,
         )
 
