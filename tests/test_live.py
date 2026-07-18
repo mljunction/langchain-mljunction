@@ -86,6 +86,20 @@ def test_native_langchain_invoke_stream_tools_and_structured_output() -> None:
 
     place = model.with_structured_output(Place).invoke("Return Paris, France")
     assert place.city and place.country
+    function_place = model.with_structured_output(
+        Place, method="function_calling"
+    ).invoke("Use the required response function for Paris, France")
+    assert function_place.city and function_place.country
+    json_mode_place = model.with_structured_output(Place, method="json_mode").invoke(
+        "Return a JSON object with city and country for Paris, France"
+    )
+    assert json_mode_place.city and json_mode_place.country
+    raw_place = model.with_structured_output(Place, include_raw=True).invoke(
+        "Return Paris, France"
+    )
+    assert raw_place["raw"].content
+    assert raw_place["parsed"].city and raw_place["parsed"].country
+    assert raw_place["parsing_error"] is None
 
     structured_stream = model.bind(
         output={
@@ -115,7 +129,7 @@ def test_native_langchain_invoke_stream_tools_and_structured_output() -> None:
     )
     structured = json.loads("".join(chunk.content for chunk in structured_chunks))
     assert len(structured["checks"]) == 8
-    assert len([chunk for chunk in structured_chunks if chunk.content]) > 1
+    assert len([chunk for chunk in structured_chunks if chunk.content]) == 1
 
 
 async def test_native_langchain_async_and_embeddings() -> None:

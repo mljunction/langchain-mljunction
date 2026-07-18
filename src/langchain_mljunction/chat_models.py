@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import AsyncIterator, Iterator, Sequence
+from operator import itemgetter
 from typing import Any
 
 from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
@@ -16,28 +17,116 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.runnables import Runnable
+from langchain_core.runnables import (
+    Runnable,
+    RunnableLambda,
+    RunnableMap,
+    RunnablePassthrough,
+)
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_core.utils.pydantic import is_basemodel_subclass
 from pydantic import ConfigDict, Field, PrivateAttr, SecretStr
 
 from langchain_mljunction._client import MLJunctionClient
 
 
+def _data_url(data: str, media_type: str) -> str:
+    return data if data.startswith("data:") else f"data:{media_type};base64,{data}"
+
+
+def _content(content: Any) -> Any:
+    """Normalize LangChain content blocks to the ML Junction native contract."""
+    if not isinstance(content, list):
+        return content
+    normalized: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            normalized.append({"type": "text", "text": str(block)})
+            continue
+        kind = block.get("type")
+        if kind == "text":
+            value = {"type": "text", "text": block.get("text", "")}
+            if block.get("cache_control"):
+                value["cache_control"] = block["cache_control"]
+            normalized.append(value)
+        elif kind == "image_url":
+            image = block.get("image_url")
+            url = image.get("url", "") if isinstance(image, dict) else image or ""
+            normalized.append({"type": "image_url", "image_url": url})
+        elif kind == "image":
+            source = block.get("source") if isinstance(block.get("source"), dict) else {}
+            media_type = block.get("mime_type") or source.get("media_type") or "image/png"
+            data = block.get("base64") or source.get("data")
+            url = block.get("url")
+            if data:
+                url = _data_url(str(data), str(media_type))
+            normalized.append({"type": "image_url", "image_url": url or ""})
+        elif kind in {"audio", "input_audio"}:
+            audio = block.get("input_audio") if isinstance(block.get("input_audio"), dict) else {}
+            media_type = block.get("mime_type") or f"audio/{audio.get('format', 'wav')}"
+            normalized.append(
+                {
+                    "type": "input_audio",
+                    "data": block.get("base64") or audio.get("data") or "",
+                    "media_type": media_type,
+                }
+            )
+        elif kind == "file":
+            file = block.get("file") if isinstance(block.get("file"), dict) else {}
+            media_type = block.get("mime_type") or "application/octet-stream"
+            data = block.get("base64") or file.get("file_data")
+            normalized.append(
+                {
+                    "type": "file",
+                    "data": _data_url(str(data), str(media_type)) if data else None,
+                    "file_id": block.get("file_id") or file.get("file_id"),
+                    "file_url": block.get("url") or file.get("file_url"),
+                    "filename": block.get("filename") or file.get("filename"),
+                    "media_type": media_type,
+                }
+            )
+        elif kind == "tool_result":
+            nested = block.get("content", "")
+            if isinstance(nested, str):
+                normalized.append({"type": "text", "text": nested})
+            else:
+                normalized.extend(_content(nested) or [])
+        elif kind in {"thinking", "redacted_thinking"}:
+            normalized.append(block)
+        elif kind not in {"tool_call", "tool_use"}:
+            normalized.append({"type": "text", "text": json.dumps(block, ensure_ascii=False)})
+    return [
+        {key: value for key, value in block.items() if value is not None}
+        for block in normalized
+    ]
+
+
 def _message(message: BaseMessage) -> dict[str, Any]:
     if isinstance(message, SystemMessage):
-        return {"role": "system", "content": message.content}
+        return {
+            "role": "system",
+            "content": _content(message.content),
+            **({"name": message.name} if message.name else {}),
+        }
     if isinstance(message, HumanMessage):
-        return {"role": "user", "content": message.content}
+        return {
+            "role": "user",
+            "content": _content(message.content),
+            **({"name": message.name} if message.name else {}),
+        }
     if isinstance(message, ToolMessage):
         return {
             "role": "tool",
-            "content": message.content,
+            "content": _content(message.content),
             "tool_call_id": message.tool_call_id,
+            **({"name": message.name} if message.name else {}),
         }
     if isinstance(message, AIMessage):
-        content: Any = message.content or None
+        content: Any = _content(message.content) or None
         value: dict[str, Any] = {"role": "assistant", "content": content}
+        if message.name:
+            value["name"] = message.name
         reasoning_details = message.additional_kwargs.get("reasoning_details") or []
         if reasoning_details:
             value["reasoning_details"] = reasoning_details
@@ -99,6 +188,7 @@ def _ai_message(body: dict[str, Any]) -> AIMessage:
         response_metadata={
             "id": body.get("id"),
             "model": body.get("model"),
+            "model_name": body.get("model"),
             "routing": body.get("routing"),
             "receipt": body.get("receipt"),
             "warnings": body.get("warnings"),
@@ -137,6 +227,29 @@ def _has_tool_result_after_latest_assistant(messages: list[BaseMessage]) -> bool
     )
 
 
+def _ai_message_chunk(message: AIMessage, *, include_output: bool = True) -> AIMessageChunk:
+    """Convert a complete response to one merge-safe LangChain chunk."""
+    tool_call_chunks = []
+    if include_output:
+        tool_call_chunks = [
+            {
+                "name": call["name"],
+                "args": json.dumps(call.get("args") or {}, ensure_ascii=False),
+                "id": call.get("id"),
+                "index": index,
+                "type": "tool_call_chunk",
+            }
+            for index, call in enumerate(message.tool_calls)
+        ]
+    return AIMessageChunk(
+        content=message.content if include_output else "",
+        additional_kwargs=message.additional_kwargs,
+        response_metadata=message.response_metadata,
+        usage_metadata=message.usage_metadata,
+        tool_call_chunks=tool_call_chunks,
+    )
+
+
 class ChatMLJunction(BaseChatModel):
     """Native LangChain chat model for ML Junction's rich Responses API."""
 
@@ -155,6 +268,7 @@ class ChatMLJunction(BaseChatModel):
     frequency_penalty: float | None = None
     presence_penalty: float | None = None
     max_tokens: int | None = None
+    stop: list[str] | None = None
     reasoning: dict[str, Any] = Field(default_factory=dict)
     output: dict[str, Any] = Field(default_factory=dict)
     requirements: dict[str, Any] = Field(default_factory=dict)
@@ -192,16 +306,42 @@ class ChatMLJunction(BaseChatModel):
     def _get_ls_params(self, stop: list[str] | None = None, **kwargs: Any) -> LangSmithParams:
         return LangSmithParams(
             ls_provider="mljunction",
-            ls_model_name=self.model,
+            ls_model_name=kwargs.get("model", self.model),
             ls_model_type="chat",
             ls_temperature=self.temperature,
             ls_max_tokens=self.max_tokens,
-            ls_stop=stop,
+            ls_stop=stop if stop is not None else self.stop,
         )
+
+    def _structured_output_bound(self, **kwargs: Any) -> bool:
+        """Return whether native JSON Schema output is active for this call."""
+        call_output = kwargs.get("output")
+        merged_output = {
+            **self.output,
+            **(call_output if isinstance(call_output, dict) else {}),
+        }
+        output_format = merged_output.get("format")
+        return (
+            isinstance(output_format, dict)
+            and output_format.get("type") == "json_schema"
+        )
+
+    def _atomic_structured_stream(self, **kwargs: Any) -> bool:
+        return bool(kwargs.get("_mljunction_structured_output")) or self._structured_output_bound(
+            **kwargs
+        )
+
+    @staticmethod
+    def _without_internal_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        cleaned = dict(kwargs)
+        cleaned.pop("_mljunction_structured_output", None)
+        return cleaned
 
     def _payload(
         self, messages: list[BaseMessage], *, stream: bool, stop: list[str] | None, **kwargs: Any
     ) -> dict[str, Any]:
+        kwargs = self._without_internal_kwargs(kwargs)
+        effective_stop = stop if stop is not None else self.stop
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [_message(message) for message in messages],
@@ -212,7 +352,7 @@ class ChatMLJunction(BaseChatModel):
                 "seed": self.seed,
                 "frequency_penalty": self.frequency_penalty,
                 "presence_penalty": self.presence_penalty,
-                "stop": stop,
+                "stop": effective_stop,
             },
             "reasoning": self.reasoning,
             "output": {**self.output, "max_tokens": self.max_tokens},
@@ -284,6 +424,21 @@ class ChatMLJunction(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
+        if self._atomic_structured_stream(**kwargs):
+            result = self._generate(
+                messages,
+                stop=stop,
+                run_manager=run_manager,
+                **kwargs,
+            )
+            generation = result.generations[0]
+            message = _ai_message_chunk(generation.message)
+            chunk = ChatGenerationChunk(
+                message=message,
+                generation_info=generation.generation_info,
+            )
+            yield chunk
+            return
         events = self._client.stream(
             "/v1/responses", self._payload(messages, stream=True, stop=stop, **kwargs)
         )
@@ -311,11 +466,16 @@ class ChatMLJunction(BaseChatModel):
                         }
                     ],
                 )
+            elif event == "response.completed":
+                complete = _ai_message(data)
+                if not complete.response_metadata.get("model_name"):
+                    model_name = kwargs.get("model", self.model)
+                    complete.response_metadata["model"] = model_name
+                    complete.response_metadata["model_name"] = model_name
+                message = _ai_message_chunk(complete, include_output=False)
             else:
                 continue
             chunk = ChatGenerationChunk(message=message)
-            if run_manager:
-                run_manager.on_llm_new_token(data.get("delta", ""), chunk=chunk)
             yield chunk
 
     async def _astream(
@@ -325,6 +485,21 @@ class ChatMLJunction(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
+        if self._atomic_structured_stream(**kwargs):
+            result = await self._agenerate(
+                messages,
+                stop=stop,
+                run_manager=run_manager,
+                **kwargs,
+            )
+            generation = result.generations[0]
+            message = _ai_message_chunk(generation.message)
+            chunk = ChatGenerationChunk(
+                message=message,
+                generation_info=generation.generation_info,
+            )
+            yield chunk
+            return
         events = self._client.astream(
             "/v1/responses", self._payload(messages, stream=True, stop=stop, **kwargs)
         )
@@ -352,11 +527,16 @@ class ChatMLJunction(BaseChatModel):
                         }
                     ],
                 )
+            elif event == "response.completed":
+                complete = _ai_message(data)
+                if not complete.response_metadata.get("model_name"):
+                    model_name = kwargs.get("model", self.model)
+                    complete.response_metadata["model"] = model_name
+                    complete.response_metadata["model_name"] = model_name
+                message = _ai_message_chunk(complete, include_output=False)
             else:
                 continue
             chunk = ChatGenerationChunk(message=message)
-            if run_manager:
-                await run_manager.on_llm_new_token(data.get("delta", ""), chunk=chunk)
             yield chunk
 
     def bind_tools(
@@ -369,10 +549,14 @@ class ChatMLJunction(BaseChatModel):
         **kwargs: Any,
     ) -> Runnable:
         formatted = [convert_to_openai_tool(tool, strict=strict) for tool in tools]
+        if tool_choice is False:
+            tool_choice = "none"
         if tool_choice is True:
             if len(formatted) != 1:
                 raise ValueError("tool_choice=True requires exactly one tool")
             tool_choice = formatted[0]["function"]["name"]
+        if tool_choice == "any":
+            tool_choice = "required"
         if isinstance(tool_choice, str) and tool_choice not in {"auto", "none", "required"}:
             tool_choice = {"type": "function", "function": {"name": tool_choice}}
         return self.bind(
@@ -386,27 +570,82 @@ class ChatMLJunction(BaseChatModel):
         self,
         schema: dict[str, Any] | type,
         *,
+        method: str = "json_schema",
         include_raw: bool = False,
+        strict: bool | None = None,
         **kwargs: Any,
     ) -> Runnable:
-        if isinstance(schema, type):
-            json_schema = convert_to_openai_tool(schema, strict=True)["function"]["parameters"]
-            parser = lambda message: schema.model_validate_json(message.content)  # noqa: E731
+        if method not in {"json_schema", "function_calling", "json_mode"}:
+            raise ValueError(
+                "method must be one of 'json_schema', 'function_calling', or 'json_mode'"
+            )
+        if method == "json_mode" and strict is not None:
+            raise ValueError("strict is not supported with method='json_mode'")
+
+        is_pydantic = isinstance(schema, type) and is_basemodel_subclass(schema)
+        formatted_tool = convert_to_openai_tool(schema, strict=strict)
+        function = formatted_tool["function"]
+        schema_name = function["name"]
+
+        def parse_content(message: AIMessage) -> Any:
+            if is_pydantic:
+                if hasattr(schema, "model_validate_json"):
+                    return schema.model_validate_json(message.content)
+                return schema.parse_raw(message.content)
+            return json.loads(message.content)
+
+        def parse_tool_call(message: AIMessage) -> Any:
+            if not message.tool_calls:
+                raise ValueError("The model did not return the required structured tool call")
+            args = message.tool_calls[0]["args"]
+            if not is_pydantic:
+                return args
+            if hasattr(schema, "model_validate"):
+                return schema.model_validate(args)
+            return schema.parse_obj(args)
+
+        trace_format = {
+            "kwargs": {"method": method},
+            "schema": schema,
+        }
+        if method == "function_calling":
+            runnable = self.bind_tools(
+                [formatted_tool],
+                tool_choice=schema_name,
+                strict=strict,
+                _mljunction_structured_output=True,
+                ls_structured_output_format=trace_format,
+                **kwargs,
+            )
+            parser = parse_tool_call
         else:
-            json_schema = schema
-            parser = lambda message: json.loads(message.content)  # noqa: E731
-        runnable = self.bind(
-            output={
-                "format": {
+            output_format: dict[str, Any] = {"type": "json_object"}
+            if method == "json_schema":
+                output_format = {
                     "type": "json_schema",
-                    "name": getattr(schema, "__name__", "response"),
-                    "schema": json_schema,
-                    "strict": True,
+                    "name": schema_name,
+                    "schema": function["parameters"],
+                    "strict": True if strict is None else strict,
                 }
-            },
-            **kwargs,
-        )
-        return runnable if include_raw else runnable | parser
+            runnable = self.bind(
+                output={"format": output_format},
+                _mljunction_structured_output=True,
+                ls_structured_output_format=trace_format,
+                **kwargs,
+            )
+            parser = parse_content
+        parser_runnable = RunnableLambda(parser)
+        if include_raw:
+            parser_assign = RunnablePassthrough.assign(
+                parsed=itemgetter("raw") | parser_runnable,
+                parsing_error=lambda _: None,
+            )
+            parser_none = RunnablePassthrough.assign(parsed=lambda _: None)
+            parser_with_fallback = parser_assign.with_fallbacks(
+                [parser_none], exception_key="parsing_error"
+            )
+            return RunnableMap(raw=runnable) | parser_with_fallback
+        return runnable | parser_runnable
 
     def close(self) -> None:
         """Close the synchronous transport owned by this model."""

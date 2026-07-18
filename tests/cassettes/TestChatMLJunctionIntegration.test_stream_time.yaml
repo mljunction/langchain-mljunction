@@ -1,0 +1,74 @@
+interactions:
+- request:
+    body: '{"model":"gemini-2.5-flash-lite","messages":[{"role":"user","content":"Write
+      a story about a cat."}],"stream":true,"sampling":{},"reasoning":{},"output":{"max_tokens":256},"requirements":{},"routing":{},"context":{},"metadata":{},"compatibility":{}}'
+    headers:
+      accept:
+      - '*/*'
+      accept-encoding:
+      - gzip, deflate, zstd
+      authorization:
+      - PLACEHOLDER
+      connection:
+      - keep-alive
+      content-length:
+      - '249'
+      content-type:
+      - application/json
+      host:
+      - 127.0.0.1:8001
+      user-agent:
+      - PLACEHOLDER
+    method: POST
+    uri: http://127.0.0.1:8001/v1/responses
+  response:
+    body:
+      string: "event: response.created\ndata: {\"id\":\"resp_d2531c74b9e54b179d045d6edd78e52e\",\"session_id\":\"sess_d618ee462c614807a489c184512631a7\",\"model\":\"gemini-2.5-flash-lite\"}\n\nevent:
+        response.route_attempt.started\ndata: {\"route_id\":\"gemini-gemini-main-gemini-2-5-flash-lite-global-standard-0d5314ed6760\",\"attempt\":1}\n\nevent:
+        response.route_committed\ndata: {\"route_id\":\"gemini-gemini-main-gemini-2-5-flash-lite-global-standard-0d5314ed6760\"}\n\nevent:
+        response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"The
+        first\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"
+        thing Bartholomew registered each morning was the sunbeam. It was a golden
+        river that\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"
+        crept across the worn rug, and he was its king. He\u2019d stretch languidly,
+        each limb extending with the precision of a dancer, until his back formed
+        a perfect arch. Then, with a sigh that was more purr than exhale\"}\n\nevent:
+        response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\",
+        he\u2019d rise, a sleek shadow of ebony fur against the awakening light.\\n\\nBartholomew
+        wasn\u2019t just any cat. He was an observer. He\u2019d spend hours perched
+        on the windowsill, his emerald eyes tracking\"}\n\nevent: response.output_text.delta\ndata:
+        {\"type\":\"response.output_text.delta\",\"delta\":\" the world outside. The
+        scurrying of a beetle, the flutter of a sparrow, the silent dance of dust
+        motes in the air \u2013 all were worthy of his intense scrutiny. He didn't
+        chase them, not usually. He preferred\"}\n\nevent: response.output_text.delta\ndata:
+        {\"type\":\"response.output_text.delta\",\"delta\":\" to understand them,
+        to catalogue their movements in the vast library of his feline mind.\\n\\nHis
+        humans, a kind couple named Eleanor and Arthur, were also part of his study.
+        He\u2019d watch them with a knowing gaze as they bust\"}\n\nevent: response.output_text.delta\ndata:
+        {\"type\":\"response.output_text.delta\",\"delta\":\"led about their mornings,
+        their lives a flurry of clattering mugs and rustling newspapers. Eleanor,
+        with her soft hands and gentle voice, was his primary source of affection,
+        her fingers always finding the perfect spot behind\"}\n\nevent: response.output_text.done\ndata:
+        {\"type\":\"response.output_text.done\",\"finish_reason\":\"length\"}\n\nevent:
+        response.completed\ndata: {\"id\":\"resp_d2531c74b9e54b179d045d6edd78e52e\",\"object\":\"response\",\"created_at\":1784354687,\"model\":\"gemini-2.5-flash-lite\",\"session_id\":\"sess_d618ee462c614807a489c184512631a7\",\"session_name\":null,\"task_id\":null,\"task_name\":null,\"app_name\":null,\"route_id\":\"gemini-gemini-main-gemini-2-5-flash-lite-global-standard-0d5314ed6760\",\"finish_reason\":\"length\",\"output\":[{\"type\":\"text\",\"text\":\"The
+        first thing Bartholomew registered each morning was the sunbeam. It was a
+        golden river that crept across the worn rug, and he was its king. He\u2019d
+        stretch languidly, each limb extending with the precision of a dancer, until
+        his back formed a perfect arch. Then, with a sigh that was more purr than
+        exhale, he\u2019d rise, a sleek shadow of ebony fur against the awakening
+        light.\\n\\nBartholomew wasn\u2019t just any cat. He was an observer. He\u2019d
+        spend hours perched on the windowsill, his emerald eyes tracking the world
+        outside. The scurrying of a beetle, the flutter of a sparrow, the silent dance
+        of dust motes in the air \u2013 all were worthy of his intense scrutiny. He
+        didn't chase them, not usually. He preferred to understand them, to catalogue
+        their movements in the vast library of his feline mind.\\n\\nHis humans, a
+        kind couple named Eleanor and Arthur, were also part of his study. He\u2019d
+        watch them with a knowing gaze as they bustled about their mornings, their
+        lives a flurry of clattering mugs and rustling newspapers. Eleanor, with her
+        soft hands and gentle voice, was his primary source of affection, her fingers
+        always finding the perfect spot behind\"}],\"usage\":{\"input_tokens\":8,\"cached_input_tokens\":0,\"cache_write_tokens\":0,\"output_tokens\":257,\"reasoning_tokens\":0,\"total_tokens\":265,\"provider_cost_usd\":null,\"billable_cost_usd\":null,\"confidence\":\"actual\",\"input_details\":{\"text_tokens\":8},\"output_details\":{\"reasoning_tokens\":0,\"text_tokens\":257},\"native_units\":{},\"line_items\":[],\"provider_reported\":true},\"warnings\":[],\"routing\":{\"selected_route\":\"gemini-gemini-main-gemini-2-5-flash-lite-global-standard-0d5314ed6760\",\"provider\":\"gemini\",\"provider_model\":\"gemini-2.5-flash-lite\",\"billing_mode\":\"platform\",\"credential_source\":\"platform_account\",\"fallback_used\":false,\"attempts\":1,\"sticky_hit\":false,\"decision_reason\":\"primary\"},\"receipt\":{\"route_id\":\"gemini-gemini-main-gemini-2-5-flash-lite-global-standard-0d5314ed6760\",\"provider\":\"gemini\",\"provider_model\":\"gemini-2.5-flash-lite\",\"region\":\"global\",\"fallback_layer\":\"primary\",\"estimated_charge_usd\":0.0001038,\"actual_charge_usd\":0.0001036,\"pricing_source\":\"https://ai.google.dev/gemini-api/docs/models#gemini-2.5-flash-lite\",\"cache\":{\"status\":\"not_reported\",\"cached_input_tokens\":0,\"reason\":\"no_previous_sticky_assignment\"},\"privacy\":{\"provider\":\"gemini\",\"region\":\"global\",\"supports_zdr\":false,\"zdr_enforced\":false,\"provider_training_allowed\":false,\"retention\":\"provider_api_policy\"}},\"metadata\":{}}\n\n"
+    headers: {}
+    status:
+      code: 200
+      message: OK
+version: 1

@@ -94,6 +94,12 @@ class Decision(BaseModel):
 decision = llm.with_structured_output(Decision).invoke("Choose: retry or escalate")
 print(decision)
 
+# LangChain's standard method selector is supported.
+decision = llm.with_structured_output(
+    Decision,
+    method="json_schema",  # also "function_calling" or "json_mode"
+).invoke("Choose: retry or escalate")
+
 
 @tool
 def lookup_customer(customer_id: str) -> str:
@@ -120,7 +126,7 @@ final = tool_llm.invoke(messages)
 print(final.content)
 ```
 
-Text and tool-call arguments can also be consumed incrementally:
+Text and ordinary bound tool-call arguments can also be consumed incrementally:
 
 ```python
 for chunk in tool_llm.stream("Check accounts 42 and 84"):
@@ -136,9 +142,18 @@ the application's responsibility: append each `ToolMessage` and invoke the model
 reasoning continuation automatically marks that follow-up as tool results, even when workflow
 messages appear after the tool result.
 
-For structured streaming, ML Junction emits the validated JSON object in
-`response.output_json.done`; the SDK converts that event into an `AIMessageChunk`. Text and tool
-arguments use incremental delta events.
+Multimodal input accepts LangChain standard blocks and the common OpenAI/Anthropic-compatible forms
+for image URLs/base64 images, base64 audio, PDFs/files, multimodal tool results, cache-control text,
+and thinking blocks. The adapter normalizes them to ML Junction's provider-neutral message contract.
+
+Structured-output runnables deliberately coerce `stream()` and `astream()` to one complete
+`AIMessageChunk`. This applies to native JSON Schema/JSON mode and to function-calling used as a
+structured-output method, so a LangChain parser never sees partial JSON. Ordinary
+`bind_tools().stream()` calls remain incremental and LangChain reassembles their argument deltas.
+
+`include_raw=True` follows LangChain's standard result contract and returns a dictionary containing
+`raw`, `parsed`, and `parsing_error`. The complete unparsed `AIMessage` is available under `raw`;
+read its `content` for native JSON Schema/JSON mode or `tool_calls` for function-calling.
 
 ## Sync, async, batch, and per-call overrides
 
@@ -199,3 +214,8 @@ ruff check src tests
 ```
 
 Live tests are opt-in with `RUN_LIVE_PROVIDER_TESTS=1`, `LIVE_API_KEY`, and `LIVE_API_BASE`.
+The `tests/standard_tests` directory subclasses LangChain's `ChatModelUnitTests` and
+`ChatModelIntegrationTests`; run it whenever the supported LangChain contract changes.
+The stream timing test uses a sanitized cassette in `tests/cassettes` and can be verified with
+`--record-mode=none`. Its replay has also been validated with the gateway stopped and pytest sockets
+disabled, ensuring routine benchmark runs cannot make an accidental provider request.
