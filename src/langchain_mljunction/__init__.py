@@ -3,6 +3,22 @@
 from langchain_mljunction._client import MLJunctionAPIError
 from langchain_mljunction.chat_models import ChatMLJunction
 from langchain_mljunction.embeddings import MLJunctionEmbeddings
+from langchain_mljunction.telemetry import (
+    MAX_AGENT_DEPTH,
+    MLJunction,
+    RunContext,
+    expose_agent_as_tool,
+)
+from langchain_mljunction.tracer import MLJunctionTracer
 
-__all__ = ["ChatMLJunction", "MLJunctionAPIError", "MLJunctionEmbeddings"]
+__all__ = [
+    "MAX_AGENT_DEPTH",
+    "ChatMLJunction",
+    "MLJunction",
+    "MLJunctionAPIError",
+    "MLJunctionEmbeddings",
+    "MLJunctionTracer",
+    "RunContext",
+    "expose_agent_as_tool",
+]
 __version__ = "0.1.0"
