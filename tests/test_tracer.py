@@ -227,13 +227,30 @@ def test_end_event_carries_duration_and_status(tracer, exporter):
     assert end["ended_at"]
 
 
-def test_error_event_captures_type_and_message(tracer, exporter):
+def test_error_event_is_privacy_safe_by_default(tracer, exporter):
     run_id = uid()
     tracer.on_tool_start({"name": "t"}, "x", run_id=run_id)
     tracer.on_tool_error(ValueError("boom"), run_id=run_id)
 
     error = by_span(exporter, run_id)[-1]
     assert error["event_type"] == "span.error"
+    assert error["error_message"] == "ValueError"
+    assert "error_payload" not in error
+
+
+def test_error_event_captures_message_only_when_opted_in(exporter):
+    tracer = MLJunctionTracer(
+        endpoint="http://localhost:8001",
+        api_key="mlj_test",
+        app_id="test-app",
+        exporter=exporter,
+        capture_content=True,
+    )
+    run_id = uid()
+    tracer.on_tool_start({"name": "t"}, "x", run_id=run_id)
+    tracer.on_tool_error(ValueError("boom"), run_id=run_id)
+
+    error = by_span(exporter, run_id)[-1]
     assert "boom" in error["error_message"]
     assert error["error_payload"]["type"] == "ValueError"
 

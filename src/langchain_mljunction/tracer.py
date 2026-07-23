@@ -24,6 +24,7 @@ import atexit
 import contextlib
 import dataclasses
 import queue
+import re
 import sys
 import threading
 import time
@@ -89,6 +90,11 @@ def _should_redact(key: str) -> bool:
     )
 
 
+_SECRET_TEXT = re.compile(
+    r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+|\b(sk-[A-Za-z0-9_-]{12,})\b"
+)
+
+
 def jsonable(
     value: Any,
     *,
@@ -111,6 +117,9 @@ def jsonable(
         return value
 
     if isinstance(value, str):
+        value = _SECRET_TEXT.sub(
+            lambda match: f"{match.group(1) or ''}[REDACTED]", value
+        )
         if len(value) > max_string_length:
             return value[:max_string_length] + "<truncated>"
         return value
@@ -437,7 +446,7 @@ class MLJunctionTracer(BaseCallbackHandler):
         app_id: str | None = None,
         app_name: str | None = None,
         environment: str = "production",
-        capture_content: bool = True,
+        capture_content: bool = False,
         exporter: BatchExporter | None = None,
     ) -> None:
         self.app_id = app_id
@@ -641,8 +650,7 @@ class MLJunctionTracer(BaseCallbackHandler):
         if state is None:
             return
 
-        self.exporter.emit(
-            {
+        event: dict[str, Any] = {
                 "event_type": "span.error",
                 "trace_id": state.trace_id,
                 "span_id": span_id,
@@ -653,19 +661,24 @@ class MLJunctionTracer(BaseCallbackHandler):
                 "started_at": state.started_at,
                 "ended_at": ended_at,
                 "duration_ms": round((ended_monotonic - state.started_monotonic) * 1000, 3),
-                "events": jsonable(state.events),
-                "attributes": jsonable(state.attributes),
-                "error_message": f"{type(error).__name__}: {error}"[:2000],
-                "error_payload": {
+                "events": jsonable(state.events) if self.capture_content else [],
+                "attributes": jsonable(state.attributes) if self.capture_content else {},
+                "error_message": (
+                    f"{type(error).__name__}: {error}"[:2000]
+                    if self.capture_content
+                    else type(error).__name__
+                ),
+                **{k: v for k, v in state.context.items() if v is not None},
+            }
+        if self.capture_content:
+            event["error_payload"] = {
                     "type": type(error).__name__,
                     "message": str(error)[:4000],
                     "stack": "".join(
                         traceback.format_exception(type(error), error, error.__traceback__)
                     )[:20_000],
-                },
-                **{k: v for k, v in state.context.items() if v is not None},
-            }
-        )
+                }
+        self.exporter.emit(event)
 
     def _span_event(self, *, run_id: UUID, name: str, data: Any) -> None:
         """Record something that happened inside a span but has no duration."""
