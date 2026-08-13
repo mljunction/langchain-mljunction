@@ -20,23 +20,20 @@ a dead endpoint costs a log line rather than a raised exception.
 
 from __future__ import annotations
 
-import atexit
 import contextlib
 import dataclasses
-import queue
+import json
 import re
-import sys
 import threading
 import time
 import traceback
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-import httpx
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
@@ -57,10 +54,6 @@ def new_id() -> str:
     """UUIDv7 where available (time-ordered, nicer as a database key)."""
     factory = getattr(uuid, "uuid7", uuid.uuid4)
     return str(factory())
-
-
-def utc_now() -> str:
-    return datetime.now(UTC).isoformat()
 
 
 _REDACTED_KEYS = frozenset(
@@ -276,150 +269,76 @@ def extract_llm_result(
     return generations_payload, combined_usage, model_data
 
 
-class BatchExporter:
-    """Non-blocking batch exporter.
+class _ManagedSpanProcessor:
+    """A closable processor safe to leave attached to a global provider."""
 
-    Callbacks fire on the agent's own thread, often inside a hot loop. Doing
-    HTTP there would add a round trip to every tool call, so callbacks only
-    enqueue and a daemon worker does the sending.
-
-    The queue is bounded. When it fills, events are dropped and counted rather
-    than blocking the agent - losing telemetry is always preferable to stalling
-    the thing being observed.
-    """
-
-    def __init__(
-        self,
-        *,
-        endpoint: str,
-        api_key: str,
-        app_id: str | None = None,
-        batch_size: int = 50,
-        flush_interval_seconds: float = 1.0,
-        queue_size: int = 10_000,
-        timeout_seconds: float = 10.0,
-        user_agent: str = "langchain-mljunction",
-    ) -> None:
-        self.endpoint = endpoint.rstrip("/") + "/v1/trace-events/batch"
-        self.batch_size = batch_size
-        self.flush_interval_seconds = flush_interval_seconds
-
-        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=queue_size)
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
         self._closed = False
-        self._dropped_events = 0
-        self._failed_batches = 0
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": user_agent,
-            "Content-Type": "application/json",
-        }
-        if app_id:
-            headers["X-App"] = app_id
-        self._client = httpx.Client(timeout=timeout_seconds, headers=headers)
+    def on_start(self, span: Any, parent_context: Any = None) -> None:
+        if not self._closed:
+            self._delegate.on_start(span, parent_context=parent_context)
 
-        self._worker = threading.Thread(
-            target=self._run, name="mljunction-trace-exporter", daemon=True
-        )
-        self._worker.start()
-        atexit.register(self.close)
+    def on_end(self, span: Any) -> None:
+        if not self._closed:
+            self._delegate.on_end(span)
 
-    @property
-    def dropped_events(self) -> int:
-        return self._dropped_events
+    def _on_ending(self, span: Any) -> None:
+        """Forward the SDK 1.44 pre-end hook used by multi-processors."""
+        if not self._closed:
+            self._delegate._on_ending(span)
 
-    @property
-    def failed_batches(self) -> int:
-        return self._failed_batches
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return bool(self._delegate.force_flush(timeout_millis)) if not self._closed else True
 
-    def emit(self, event: dict[str, Any]) -> None:
-        if self._closed:
-            return
-        try:
-            self._queue.put_nowait(event)
-        except queue.Full:
-            self._dropped_events += 1
-
-    def _run(self) -> None:
-        stopping = False
-        while not stopping:
-            item = self._queue.get()
-            if item is None:
-                break
-            batch = [item]
-            deadline = time.monotonic() + self.flush_interval_seconds
-            while len(batch) < self.batch_size:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    item = self._queue.get(timeout=remaining)
-                except queue.Empty:
-                    break
-                if item is None:
-                    stopping = True
-                    break
-                batch.append(item)
-            self._send(batch)
-
-    def _send(self, events: list[dict[str, Any]]) -> None:
-        for attempt in range(3):
-            try:
-                response = self._client.post(
-                    self.endpoint,
-                    json={"schema_version": "1.0", "events": events},
-                )
-                response.raise_for_status()
-                return
-            except Exception as error:
-                if attempt == 2:
-                    self._failed_batches += 1
-                    # Reported, never raised. An unreachable tracing endpoint
-                    # must not become an exception inside the customer's agent.
-                    print(
-                        f"ML Junction tracing export failed after 3 attempts: "
-                        f"{type(error).__name__}: {error}",
-                        file=sys.stderr,
-                    )
-                    return
-                time.sleep(0.25 * (2**attempt))
-
-    def flush(self, timeout: float = 5.0) -> bool:
-        """Block until the queue drains. For tests and short-lived scripts."""
-        deadline = time.monotonic() + timeout
-        while not self._queue.empty() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        # The worker may still be mid-POST after the queue empties.
-        time.sleep(0.05)
-        return self._queue.empty()
-
-    def close(self) -> None:
+    def shutdown(self) -> None:
         if self._closed:
             return
         self._closed = True
-        with contextlib.suppress(queue.Full):
-            self._queue.put(None, timeout=1)
-        self._worker.join(timeout=5)
-        self._client.close()
+        self._delegate.shutdown()
+
+
+class _StartSnapshotProcessor(_ManagedSpanProcessor):
+    """Queue an immutable start snapshot for opt-in in-flight visibility."""
+
+    def on_start(self, span: Any, parent_context: Any = None) -> None:
+        if self._closed:
+            return
+        # SpanProcessor.on_start receives the mutable SDK Span. Snapshot it now
+        # so the background batch does not observe the later end state.
+        self._delegate.on_end(span._readable_span())
+
+    def on_end(self, span: Any) -> None:
+        pass
+
+    def _on_ending(self, span: Any) -> None:
+        pass
+
+
+def _attribute(value: Any) -> str | bool | int | float | list[str] | None:
+    """Convert arbitrary callback data into an OTel-compatible attribute."""
+    safe = jsonable(value)
+    if safe is None or isinstance(safe, str | bool | int | float):
+        return safe
+    if isinstance(safe, list) and all(isinstance(item, str) for item in safe):
+        return safe
+    return json.dumps(safe, separators=(",", ":"), ensure_ascii=False)
 
 
 @dataclass
 class RunState:
     """In-flight span. Lives from the start callback to the end/error one."""
 
-    trace_id: str
-    parent_span_id: str | None
-    started_at: str
+    span: Any
+    context_token: Any
     started_monotonic: float
     span_kind: str
     name: str
     context: dict[str, Any]
     first_token_monotonic: float | None = None
     stream_chunks: int = 0
-    # Point-in-time occurrences, flushed with the terminal event. Sending them
-    # cumulatively (rather than as their own events) is what lets the server
-    # use replace-semantics and stay idempotent under retry.
-    events: list[dict[str, Any]] = field(default_factory=list)
+    event_count: int = 0
     attributes: dict[str, Any] = field(default_factory=dict)
 
 
@@ -447,23 +366,101 @@ class MLJunctionTracer(BaseCallbackHandler):
         app_name: str | None = None,
         environment: str = "production",
         capture_content: bool = False,
-        exporter: BatchExporter | None = None,
+        export_inflight: bool = False,
+        span_exporter: Any | None = None,
+        tracer_provider: Any | None = None,
     ) -> None:
+        try:
+            from opentelemetry import context as otel_context
+            from opentelemetry import trace
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        except ImportError as exc:  # pragma: no cover - exercised without the extra installed
+            raise ImportError(
+                "Agent tracing requires the OpenTelemetry extra: "
+                "pip install 'langchain-mljunction[otel]'"
+            ) from exc
+
         self.app_id = app_id
         self.app_name = app_name
         self.environment = environment
         self.capture_content = capture_content
-        self.exporter = exporter or BatchExporter(
-            endpoint=endpoint, api_key=api_key, app_id=app_id
+        headers = {"Authorization": f"Bearer {api_key}"}
+        if app_id:
+            headers["X-App"] = app_id
+        exporter = span_exporter or OTLPSpanExporter(
+            endpoint=endpoint.rstrip("/") + "/v1/traces",
+            headers=headers,
+            timeout=10,
         )
+        processor = _ManagedSpanProcessor(
+            BatchSpanProcessor(
+                exporter,
+                max_export_batch_size=50,
+                schedule_delay_millis=1_000,
+                max_queue_size=10_000,
+                export_timeout_millis=10_000,
+            )
+        )
+        provider = tracer_provider
+        if provider is None:
+            current = trace.get_tracer_provider()
+            if hasattr(current, "add_span_processor"):
+                provider = current
+            else:
+                resource_attributes: dict[str, Any] = {
+                    "service.name": app_name or app_id or "langchain-mljunction",
+                    "deployment.environment.name": environment,
+                }
+                if app_id:
+                    resource_attributes["service.instance.id"] = app_id
+                    resource_attributes["mlj.app.id"] = app_id
+                provider = TracerProvider(resource=Resource.create(resource_attributes))
+                trace.set_tracer_provider(provider)
+        provider.add_span_processor(processor)
+        inflight_processor = None
+        if export_inflight:
+            inflight_exporter = span_exporter or OTLPSpanExporter(
+                endpoint=endpoint.rstrip("/") + "/v1/traces",
+                headers=headers,
+                timeout=10,
+            )
+            inflight_processor = _StartSnapshotProcessor(
+                BatchSpanProcessor(
+                    inflight_exporter,
+                    max_export_batch_size=50,
+                    schedule_delay_millis=1_000,
+                    max_queue_size=10_000,
+                    export_timeout_millis=10_000,
+                )
+            )
+            provider.add_span_processor(inflight_processor)
+        self._provider = provider
+        self._processor = processor
+        self._inflight_processor = inflight_processor
+        self._export_inflight = export_inflight
+        self._trace = trace
+        self._otel_context = otel_context
+        self._tracer = provider.get_tracer("langchain-mljunction", "0.1.0")
         self._runs: dict[str, RunState] = {}
         self._lock = threading.RLock()
 
     def close(self) -> None:
-        self.exporter.close()
+        self._processor.shutdown()
+        if self._inflight_processor is not None:
+            self._inflight_processor.shutdown()
 
     def flush(self, timeout: float = 5.0) -> bool:
-        return self.exporter.flush(timeout)
+        timeout_millis = max(1, int(timeout * 1000))
+        complete = self._processor.force_flush(timeout_millis)
+        inflight = (
+            self._inflight_processor.force_flush(timeout_millis)
+            if self._inflight_processor is not None
+            else True
+        )
+        return complete and inflight
 
     # -- context -----------------------------------------------------------
 
@@ -519,19 +516,16 @@ class MLJunctionTracer(BaseCallbackHandler):
         metadata: Mapping[str, Any] | None = None,
         attributes: Mapping[str, Any] | None = None,
     ) -> None:
-        span_id = str(run_id)
-        parent_span_id = str(parent_run_id) if parent_run_id else None
-        started_at = utc_now()
+        run_key = str(run_id)
+        parent_key = str(parent_run_id) if parent_run_id else None
         started_monotonic = time.monotonic()
 
         with self._lock:
-            parent = self._runs.get(parent_span_id) if parent_span_id else None
+            parent = self._runs.get(parent_key) if parent_key else None
             context = self._context(metadata)
             # A span with no known parent starts its own trace. That is also
             # what happens when a subagent is invoked without the active
             # config - the tree silently splits in two. See child_agent_config.
-            trace_id = parent.trace_id if parent else span_id
-
             # Inherit correlation downward: an inner tool span usually carries
             # no metadata of its own, but it belongs to the same session and
             # agent as whatever started it.
@@ -556,40 +550,57 @@ class MLJunctionTracer(BaseCallbackHandler):
                     if not context.get("agent_name"):
                         context["agent_name"] = name
 
+            initial_attributes: dict[str, Any] = {
+                "gen_ai.operation.name": effective_kind,
+                "deployment.environment.name": self.environment,
+                "mlj.tags": list(tags or []),
+                **({"mlj.in_flight": True} if self._export_inflight else {}),
+                **({"service.name": self.app_name} if self.app_name else {}),
+                **{
+                    f"mlj.agent.{key.removeprefix('agent_')}": value
+                    for key, value in context.items()
+                    if key.startswith("agent_") and value is not None
+                },
+                **{
+                    {
+                        "app_id": "mlj.app.id",
+                        "session_id": "mlj.session.id",
+                    }[key]: value
+                    for key, value in context.items()
+                    if key in {"app_id", "session_id"} and value is not None
+                },
+            }
+            for key, value in (attributes or {}).items():
+                initial_attributes[f"mlj.attribute.{key}"] = value
+            if self.capture_content:
+                initial_attributes["mlj.capture.input"] = input_data
+            otel_attributes = {
+                key: converted
+                for key, value in initial_attributes.items()
+                if (converted := _attribute(value)) is not None
+            }
+            parent_context = (
+                self._trace.set_span_in_context(parent.span)
+                if parent
+                else self._otel_context.get_current()
+            )
+            span = self._tracer.start_span(
+                name,
+                context=parent_context,
+                attributes=otel_attributes,
+                start_time=time.time_ns(),
+            )
+            token = self._otel_context.attach(self._trace.set_span_in_context(span))
             state = RunState(
-                trace_id=trace_id,
-                parent_span_id=parent_span_id,
-                started_at=started_at,
+                span=span,
+                context_token=token,
                 started_monotonic=started_monotonic,
                 span_kind=effective_kind,
                 name=name,
                 context=context,
                 attributes=dict(attributes or {}),
             )
-            self._runs[span_id] = state
-
-        event: dict[str, Any] = {
-            "event_type": "span.start",
-            "trace_id": trace_id,
-            "span_id": span_id,
-            "parent_span_id": parent_span_id,
-            "span_kind": effective_kind,
-            "name": name,
-            "timestamp": started_at,
-            "started_at": started_at,
-            "attributes": jsonable(
-                {
-                    **(attributes or {}),
-                    "tags": list(tags or []),
-                    "environment": self.environment,
-                    **({"app_name": self.app_name} if self.app_name else {}),
-                }
-            ),
-            **{k: v for k, v in context.items() if v is not None},
-        }
-        if self.capture_content:
-            event["input_payload"] = {"value": jsonable(input_data)}
-        self.exporter.emit(event)
+            self._runs[run_key] = state
 
     def _finish(
         self,
@@ -599,86 +610,68 @@ class MLJunctionTracer(BaseCallbackHandler):
         attributes: Mapping[str, Any] | None = None,
     ) -> None:
         span_id = str(run_id)
-        ended_monotonic = time.monotonic()
-        ended_at = utc_now()
-
         with self._lock:
             state = self._runs.pop(span_id, None)
         if state is None:
             return
 
-        event: dict[str, Any] = {
-            "event_type": "span.end",
-            "trace_id": state.trace_id,
-            "span_id": span_id,
-            "parent_span_id": state.parent_span_id,
-            "span_kind": state.span_kind,
-            "name": state.name,
-            "timestamp": ended_at,
-            "started_at": state.started_at,
-            "ended_at": ended_at,
-            "duration_ms": round((ended_monotonic - state.started_monotonic) * 1000, 3),
-            "events": jsonable(state.events),
-            "attributes": jsonable(
-                {
-                    **state.attributes,
-                    **(attributes or {}),
-                    "stream_chunks": state.stream_chunks,
-                }
-            ),
-            **{k: v for k, v in state.context.items() if v is not None},
-        }
+        span = state.span
+        if self._export_inflight:
+            span.set_attribute("mlj.in_flight", False)
+        span.set_attribute("mlj.stream_chunks", state.stream_chunks)
         if state.first_token_monotonic is not None:
-            event["ttft_ms"] = round(
+            span.set_attribute(
+                "mlj.ttft_ms",
+                round(
                 (state.first_token_monotonic - state.started_monotonic) * 1000, 3
+                ),
             )
         # An LLM span learns its gateway request_id only from the response, so
         # it overrides any inherited value here.
         if attributes and attributes.get("request_id"):
-            event["request_id"] = str(attributes["request_id"])
+            span.set_attribute("mlj.request.id", str(attributes["request_id"]))
+        self._set_result_attributes(span, attributes or {})
         if self.capture_content:
-            event["output_payload"] = {"value": jsonable(output)}
-        self.exporter.emit(event)
+            span.set_attribute("mlj.capture.output", _attribute(output) or "null")
+        from opentelemetry.trace import Status, StatusCode
+
+        span.set_status(Status(StatusCode.OK))
+        span.end(end_time=time.time_ns())
+        with contextlib.suppress(ValueError, RuntimeError):
+            self._otel_context.detach(state.context_token)
 
     def _error(self, *, run_id: UUID, error: BaseException) -> None:
         span_id = str(run_id)
-        ended_monotonic = time.monotonic()
-        ended_at = utc_now()
-
         with self._lock:
             state = self._runs.pop(span_id, None)
         if state is None:
             return
 
-        event: dict[str, Any] = {
-                "event_type": "span.error",
-                "trace_id": state.trace_id,
-                "span_id": span_id,
-                "parent_span_id": state.parent_span_id,
-                "span_kind": state.span_kind,
-                "name": state.name,
-                "timestamp": ended_at,
-                "started_at": state.started_at,
-                "ended_at": ended_at,
-                "duration_ms": round((ended_monotonic - state.started_monotonic) * 1000, 3),
-                "events": jsonable(state.events) if self.capture_content else [],
-                "attributes": jsonable(state.attributes) if self.capture_content else {},
-                "error_message": (
-                    f"{type(error).__name__}: {error}"[:2000]
-                    if self.capture_content
-                    else type(error).__name__
-                ),
-                **{k: v for k, v in state.context.items() if v is not None},
-            }
+        span = state.span
+        if self._export_inflight:
+            span.set_attribute("mlj.in_flight", False)
+        from opentelemetry.trace import Status, StatusCode
+
+        description = (
+            f"{type(error).__name__}: {error}"[:2000]
+            if self.capture_content
+            else type(error).__name__
+        )
+        span.set_status(Status(StatusCode.ERROR, description=description))
         if self.capture_content:
-            event["error_payload"] = {
+            span.set_attribute(
+                "mlj.capture.error",
+                _attribute({
                     "type": type(error).__name__,
                     "message": str(error)[:4000],
                     "stack": "".join(
                         traceback.format_exception(type(error), error, error.__traceback__)
                     )[:20_000],
-                }
-        self.exporter.emit(event)
+                }) or "{}",
+            )
+        span.end(end_time=time.time_ns())
+        with contextlib.suppress(ValueError, RuntimeError):
+            self._otel_context.detach(state.context_token)
 
     def _span_event(self, *, run_id: UUID, name: str, data: Any) -> None:
         """Record something that happened inside a span but has no duration."""
@@ -688,8 +681,40 @@ class MLJunctionTracer(BaseCallbackHandler):
             if state is None:
                 return
             # Bounded: a retry storm must not grow this list without limit.
-            if len(state.events) < 200:
-                state.events.append({"name": name, "at": utc_now(), "data": jsonable(data)})
+            if state.event_count < 200:
+                state.span.add_event(
+                    name,
+                    attributes={"mlj.event.data": _attribute(data) or "null"},
+                    timestamp=time.time_ns(),
+                )
+                state.event_count += 1
+
+    @staticmethod
+    def _set_result_attributes(span: Any, attributes: Mapping[str, Any]) -> None:
+        usage = attributes.get("usage")
+        if isinstance(usage, Mapping):
+            for source, target in (
+                ("input_tokens", "gen_ai.usage.input_tokens"),
+                ("output_tokens", "gen_ai.usage.output_tokens"),
+                ("total_tokens", "gen_ai.usage.total_tokens"),
+            ):
+                value = usage.get(source)
+                if isinstance(value, int | float):
+                    span.set_attribute(target, value)
+        model = attributes.get("model")
+        if isinstance(model, Mapping):
+            if model.get("name"):
+                span.set_attribute("gen_ai.request.model", str(model["name"]))
+            if model.get("provider"):
+                span.set_attribute("gen_ai.system", str(model["provider"]))
+            if model.get("finish_reason"):
+                span.set_attribute("gen_ai.response.finish_reasons", [str(model["finish_reason"])])
+        for key, value in attributes.items():
+            if key in {"usage", "model", "request_id"}:
+                continue
+            converted = _attribute(value)
+            if converted is not None:
+                span.set_attribute(f"mlj.attribute.{key}", converted)
 
     # -- chains ------------------------------------------------------------
 

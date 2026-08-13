@@ -4,16 +4,16 @@
 a run. Attach it once at the top and LangChain propagates it to every child
 runnable automatically.
 
-The one thing it cannot do on its own is follow an agent you invoke by hand
-inside a tool function. LangChain propagates config through *runnables*, not
-through arbitrary Python calls, so a subagent invoked as
+OpenTelemetry context propagation preserves the execution trace when an agent
+is invoked by hand inside a tool function. Passing the active config through
+`child_agent_config` (or using `expose_agent_as_tool`) additionally preserves
+ML Junction's agent identity, role, depth, session, and task metadata. A call
+such as
 
     subagent.invoke({"messages": messages})
 
-starts a brand new root and the tree silently splits in two - no error, no
-warning, just a flat trace and a second root you did not ask for. Passing the
-active config through `child_agent_config` (or using `expose_agent_as_tool`,
-which does it for you) is what keeps the nesting intact.
+still participates in the active OTel trace, but lacks that richer agent
+metadata unless the config is threaded through.
 """
 
 from __future__ import annotations
@@ -73,6 +73,7 @@ class MLJunction:
         app_name: str | None = None,
         environment: str = "production",
         capture_content: bool = True,
+        export_inflight: bool = False,
         tracer: MLJunctionTracer | None = None,
     ) -> None:
         self.app_id = app_id
@@ -85,6 +86,7 @@ class MLJunction:
             app_name=app_name,
             environment=environment,
             capture_content=capture_content,
+            export_inflight=export_inflight,
         )
 
     # -- root --------------------------------------------------------------

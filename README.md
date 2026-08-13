@@ -22,6 +22,12 @@ For local SDK development:
 pip install -e ".[test]"
 ```
 
+Agent tracing uses the optional OpenTelemetry transport:
+
+```bash
+pip install "langchain-mljunction[otel]"
+```
+
 Set `MLJUNCTION_API_KEY` and optionally `MLJUNCTION_BASE_URL`, or pass both to the constructor.
 The default base URL is `http://localhost:8001`, so the SDK works directly with a local ML Junction
 server.
@@ -186,6 +192,26 @@ embeddings = MLJunctionEmbeddings(
 )
 vectors = embeddings.embed_documents(["route", "receipt", "reasoning"])
 ```
+
+## OpenTelemetry agent tracing
+
+```python
+from langchain_mljunction import MLJunction
+
+telemetry = MLJunction(
+    api_key="mlj_...",
+    base_url="https://api.mljunction.com",
+    app_id="support-bot",
+)
+run = telemetry.context(agent_name="coordinator", session_id="conversation-42")
+agent.invoke({"messages": [...]}, config=run.config)
+telemetry.flush()
+```
+
+The callback bridge emits standard OTLP spans to `/v1/traces`, reuses an
+existing global OpenTelemetry provider when present, and supports dual export.
+Set `export_inflight=True` only when debugging hung agents; it emits an extra
+start snapshot for each span and is off by default.
 
 Every `AIMessage` carries standard `usage_metadata`. `response_metadata` retains request ID,
 model, routing, receipt, warnings, session/task/app identity, and reasoning state—nothing important
