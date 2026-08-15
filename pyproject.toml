@@ -24,6 +24,18 @@ test = [
     "ruff>=0.12",
 ]
 
+# `test` above stays a published extra so consumers can install it. This group
+# is what `uv sync` installs by default, so a fresh checkout can run pytest
+# without knowing to pass --extra test; without it, tests/test_tracer.py fails
+# at collection with ModuleNotFoundError: opentelemetry.
+[dependency-groups]
+dev = [
+    "langchain-mljunction[test]",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
