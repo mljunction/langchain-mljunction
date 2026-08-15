@@ -117,9 +117,7 @@ def test_reasoning_details_and_token_round_trip_without_becoming_text() -> None:
 def test_explicit_null_continuation_disables_automatic_replay() -> None:
     previous = AIMessage(
         content="answer",
-        response_metadata={
-            "reasoning": {"continuation_token": "gwrt_v3.a-valid-long-token"}
-        },
+        response_metadata={"reasoning": {"continuation_token": "gwrt_v3.a-valid-long-token"}},
     )
     model = ChatMLJunction(model="test-model", api_key="test-key")
     payload = model._payload(
@@ -135,9 +133,7 @@ def test_tool_result_continuation_sets_input_type() -> None:
     previous = AIMessage(
         content="",
         tool_calls=[{"name": "weather", "args": {}, "id": "call_1"}],
-        response_metadata={
-            "reasoning": {"continuation_token": "gwrt_v3.a-valid-long-token"}
-        },
+        response_metadata={"reasoning": {"continuation_token": "gwrt_v3.a-valid-long-token"}},
     )
     model = ChatMLJunction(model="test-model", api_key="test-key")
     payload = model._payload(
@@ -156,9 +152,7 @@ def test_tool_result_continuation_survives_trailing_workflow_context() -> None:
     previous = AIMessage(
         content="",
         tool_calls=[{"name": "weather", "args": {}, "id": "call_1"}],
-        response_metadata={
-            "reasoning": {"continuation_token": "gwrt_v3.a-valid-long-token"}
-        },
+        response_metadata={"reasoning": {"continuation_token": "gwrt_v3.a-valid-long-token"}},
     )
     model = ChatMLJunction(model="test-model", api_key="test-key")
     payload = model._payload(
@@ -208,9 +202,7 @@ def test_constructor_stop_sequences_are_sent_to_gateway() -> None:
     payload = model._payload([HumanMessage(content="hello")], stream=False, stop=None)
     assert payload["sampling"]["stop"] == ["DONE"]
 
-    overridden = model._payload(
-        [HumanMessage(content="hello")], stream=False, stop=["STOP"]
-    )
+    overridden = model._payload([HumanMessage(content="hello")], stream=False, stop=["STOP"])
     assert overridden["sampling"]["stop"] == ["STOP"]
 
 
@@ -370,10 +362,7 @@ async def test_async_structured_json_stream_produces_a_langchain_generation() ->
 
     model._client.astream = lambda *_args, **_kwargs: events()
 
-    chunks = [
-        chunk
-        async for chunk in model._astream([HumanMessage(content="Return JSON")])
-    ]
+    chunks = [chunk async for chunk in model._astream([HumanMessage(content="Return JSON")])]
 
     assert len(chunks) == 1
     assert chunks[0].message.content == '{"ok":true}'

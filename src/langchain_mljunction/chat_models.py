@@ -97,8 +97,7 @@ def _content(content: Any) -> Any:
         elif kind not in {"tool_call", "tool_use"}:
             normalized.append({"type": "text", "text": json.dumps(block, ensure_ascii=False)})
     return [
-        {key: value for key, value in block.items() if value is not None}
-        for block in normalized
+        {key: value for key, value in block.items() if value is not None} for block in normalized
     ]
 
 
@@ -222,8 +221,7 @@ def _has_tool_result_after_latest_assistant(messages: list[BaseMessage]) -> bool
     if latest_assistant_index is None:
         return False
     return any(
-        isinstance(message, ToolMessage)
-        for message in messages[latest_assistant_index + 1 :]
+        isinstance(message, ToolMessage) for message in messages[latest_assistant_index + 1 :]
     )
 
 
@@ -321,10 +319,7 @@ class ChatMLJunction(BaseChatModel):
             **(call_output if isinstance(call_output, dict) else {}),
         }
         output_format = merged_output.get("format")
-        return (
-            isinstance(output_format, dict)
-            and output_format.get("type") == "json_schema"
-        )
+        return isinstance(output_format, dict) and output_format.get("type") == "json_schema"
 
     def _atomic_structured_stream(self, **kwargs: Any) -> bool:
         return bool(kwargs.get("_mljunction_structured_output")) or self._structured_output_bound(

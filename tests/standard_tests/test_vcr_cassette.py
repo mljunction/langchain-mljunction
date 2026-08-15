@@ -3,9 +3,7 @@ from pathlib import Path
 import yaml
 
 CASSETTE = (
-    Path(__file__).parents[1]
-    / "cassettes"
-    / "TestChatMLJunctionIntegration.test_stream_time.yaml"
+    Path(__file__).parents[1] / "cassettes" / "TestChatMLJunctionIntegration.test_stream_time.yaml"
 )
 
 

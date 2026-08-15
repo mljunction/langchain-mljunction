@@ -7,9 +7,7 @@ from langchain_tests.integration_tests import ChatModelIntegrationTests
 
 from langchain_mljunction import ChatMLJunction
 
-RUN_LIVE = os.getenv("RUN_LIVE_PROVIDER_TESTS") == "1" and bool(
-    os.getenv("LIVE_API_KEY")
-)
+RUN_LIVE = os.getenv("RUN_LIVE_PROVIDER_TESTS") == "1" and bool(os.getenv("LIVE_API_KEY"))
 
 pytestmark = pytest.mark.skipif(not RUN_LIVE, reason="live integration test disabled")
 

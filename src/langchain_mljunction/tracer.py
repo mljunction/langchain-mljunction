@@ -83,9 +83,7 @@ def _should_redact(key: str) -> bool:
     )
 
 
-_SECRET_TEXT = re.compile(
-    r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+|\b(sk-[A-Za-z0-9_-]{12,})\b"
-)
+_SECRET_TEXT = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+|\b(sk-[A-Za-z0-9_-]{12,})\b")
 
 
 def jsonable(
@@ -110,9 +108,7 @@ def jsonable(
         return value
 
     if isinstance(value, str):
-        value = _SECRET_TEXT.sub(
-            lambda match: f"{match.group(1) or ''}[REDACTED]", value
-        )
+        value = _SECRET_TEXT.sub(lambda match: f"{match.group(1) or ''}[REDACTED]", value)
         if len(value) > max_string_length:
             return value[:max_string_length] + "<truncated>"
         return value
@@ -148,8 +144,10 @@ def jsonable(
                 output["<truncated>"] = f"{len(value) - max_collection_length} additional entries"
                 break
             key = str(raw_key)
-            output[key] = "<redacted>" if _should_redact(key) else jsonable(
-                item, depth=depth + 1, max_depth=max_depth
+            output[key] = (
+                "<redacted>"
+                if _should_redact(key)
+                else jsonable(item, depth=depth + 1, max_depth=max_depth)
             )
         return output
 
@@ -622,9 +620,7 @@ class MLJunctionTracer(BaseCallbackHandler):
         if state.first_token_monotonic is not None:
             span.set_attribute(
                 "mlj.ttft_ms",
-                round(
-                (state.first_token_monotonic - state.started_monotonic) * 1000, 3
-                ),
+                round((state.first_token_monotonic - state.started_monotonic) * 1000, 3),
             )
         # An LLM span learns its gateway request_id only from the response, so
         # it overrides any inherited value here.
@@ -661,13 +657,16 @@ class MLJunctionTracer(BaseCallbackHandler):
         if self.capture_content:
             span.set_attribute(
                 "mlj.capture.error",
-                _attribute({
-                    "type": type(error).__name__,
-                    "message": str(error)[:4000],
-                    "stack": "".join(
-                        traceback.format_exception(type(error), error, error.__traceback__)
-                    )[:20_000],
-                }) or "{}",
+                _attribute(
+                    {
+                        "type": type(error).__name__,
+                        "message": str(error)[:4000],
+                        "stack": "".join(
+                            traceback.format_exception(type(error), error, error.__traceback__)
+                        )[:20_000],
+                    }
+                )
+                or "{}",
             )
         span.end(end_time=time.time_ns())
         with contextlib.suppress(ValueError, RuntimeError):

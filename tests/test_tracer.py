@@ -87,9 +87,7 @@ def test_orphan_span_starts_its_own_trace(tracer, exporter):
     assert span.parent is None
 
 
-def test_agent_boundary_and_correlation_become_semantic_attributes(
-    tracer, exporter, telemetry
-):
+def test_agent_boundary_and_correlation_become_semantic_attributes(tracer, exporter, telemetry):
     root_config = telemetry.context(agent_name="coordinator", session_id="sess-1").config
     child_config = telemetry.child_agent_config(root_config, agent_name="researcher")
     root, child = uid(), uid()
@@ -118,9 +116,7 @@ def test_agent_boundary_and_correlation_become_semantic_attributes(
 def test_nesting_works_at_arbitrary_depth(tracer, exporter, telemetry, depth):
     config = telemetry.context(agent_name="agent-0").config
     run_ids = [uid()]
-    tracer.on_chain_start(
-        {"name": "agent-0"}, {}, run_id=run_ids[0], metadata=config["metadata"]
-    )
+    tracer.on_chain_start({"name": "agent-0"}, {}, run_id=run_ids[0], metadata=config["metadata"])
     for level in range(1, depth + 1):
         config = telemetry.child_agent_config(config, agent_name=f"agent-{level}")
         run_id = uid()
@@ -138,23 +134,17 @@ def test_nesting_works_at_arbitrary_depth(tracer, exporter, telemetry, depth):
     spans = exported(tracer, exporter)
     assert len(spans) == depth + 1
     assert len({span.context.trace_id for span in spans}) == 1
-    assert sorted(span.attributes["mlj.agent.depth"] for span in spans) == list(
-        range(depth + 1)
-    )
+    assert sorted(span.attributes["mlj.agent.depth"] for span in spans) == list(range(depth + 1))
 
 
-def test_active_otel_context_preserves_trace_without_langchain_parent(
-    tracer, exporter, telemetry
-):
+def test_active_otel_context_preserves_trace_without_langchain_parent(tracer, exporter, telemetry):
     root_config = telemetry.context(agent_name="coordinator").config
     detached = telemetry.context(agent_name="researcher").config
     root, child = uid(), uid()
     tracer.on_chain_start(
         {"name": "coordinator"}, {}, run_id=root, metadata=root_config["metadata"]
     )
-    tracer.on_chain_start(
-        {"name": "researcher"}, {}, run_id=child, metadata=detached["metadata"]
-    )
+    tracer.on_chain_start({"name": "researcher"}, {}, run_id=child, metadata=detached["metadata"])
     tracer.on_chain_end({}, run_id=child)
     tracer.on_chain_end({}, run_id=root)
 
@@ -223,9 +213,7 @@ def test_streaming_usage_model_and_request_id_use_gen_ai_attributes(tracer, expo
     tracer.on_chat_model_start({"name": "model"}, [[]], run_id=run_id)
     for token in "abc":
         tracer.on_llm_new_token(token, run_id=run_id)
-    tracer.on_llm_end(
-        LLMResult(generations=[[ChatGeneration(message=message)]]), run_id=run_id
-    )
+    tracer.on_llm_end(LLMResult(generations=[[ChatGeneration(message=message)]]), run_id=run_id)
 
     span = by_name(tracer, exporter, "model")
     assert span.attributes["mlj.request.id"] == "req_abc123"
