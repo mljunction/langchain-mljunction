@@ -1,10 +1,17 @@
 """Outcome reporting: the addressing rules and the idempotency key."""
 
 from datetime import UTC, datetime
+from typing import ClassVar
 
 import pytest
 
-from langchain_mljunction.outcomes import OutcomeReceipt, _payload, request_id_of
+import langchain_mljunction.outcomes as outcomes_module
+from langchain_mljunction.outcomes import (
+    OutcomeReceipt,
+    Outcomes,
+    _payload,
+    request_id_of,
+)
 
 
 def _valid(**overrides):
@@ -92,3 +99,55 @@ class TestRequestIdHelper:
 
     def test_a_message_from_elsewhere_returns_none(self) -> None:
         assert request_id_of(type("M", (), {})()) is None
+
+
+class _FakeClient:
+    instances: ClassVar[list["_FakeClient"]] = []
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.put_calls: list[tuple[str, dict]] = []
+        self.closed = False
+        self.instances.append(self)
+
+    def put(self, path: str, payload: dict) -> dict:
+        self.put_calls.append((path, payload))
+        return {"name": path.rsplit("/", 1)[-1], **payload}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestDefinitionRegistrationCredentials:
+    def setup_method(self) -> None:
+        _FakeClient.instances.clear()
+
+    def test_registration_refuses_an_inference_key(self, monkeypatch) -> None:
+        monkeypatch.setattr(outcomes_module, "MLJunctionClient", _FakeClient)
+        client = Outcomes(api_key="mlj_live_inference")
+
+        with pytest.raises(ValueError, match=r"management key.*adaptive:write"):
+            client.register("resolved")
+
+    def test_registration_uses_the_separate_management_plane(self, monkeypatch) -> None:
+        monkeypatch.setattr(outcomes_module, "MLJunctionClient", _FakeClient)
+        client = Outcomes(
+            api_key="mlj_live_inference",
+            management_api_key="mlj_mgmt_control",
+            base_url="http://localhost:8000",
+        )
+
+        body = client.register("resolved")
+
+        assert body["name"] == "resolved"
+        assert len(_FakeClient.instances) == 2
+        inference, management = _FakeClient.instances
+        assert inference.kwargs["api_key"] == "mlj_live_inference"
+        assert management.kwargs["api_key"] == "mlj_mgmt_control"
+        assert management.put_calls[0][0] == (
+            "/v1/management/adaptive/outcome-definitions/resolved"
+        )
+
+        client.close()
+        assert inference.closed is True
+        assert management.closed is True

@@ -101,15 +101,16 @@ def _payload(
 class Outcomes:
     """Client for ``POST /v1/outcomes``.
 
-    Reuses the same transport and credentials as the chat integration, so an
-    application that already configured ``MLJUNCTION_API_KEY`` needs no extra
-    setup.
+    Reporting reuses the inference credential. Definition registration is a
+    control-plane mutation and therefore requires a separate management key
+    carrying ``adaptive:write``.
     """
 
     def __init__(
         self,
         *,
         api_key: str | None = None,
+        management_api_key: str | None = None,
         base_url: str | None = None,
         timeout: float = 30.0,
         app_name: str | None = None,
@@ -119,11 +120,25 @@ class Outcomes:
             raise ValueError(
                 "an API key is required: pass api_key= or set MLJUNCTION_API_KEY"
             )
+        resolved_base_url = base_url or os.environ.get("MLJUNCTION_BASE_URL") or DEFAULT_BASE_URL
         self._client = MLJunctionClient(
             api_key=resolved_key,
-            base_url=base_url or os.environ.get("MLJUNCTION_BASE_URL") or DEFAULT_BASE_URL,
+            base_url=resolved_base_url,
             timeout=timeout,
             app_name=app_name,
+        )
+        resolved_management_key = management_api_key or os.environ.get(
+            "MLJUNCTION_MANAGEMENT_API_KEY"
+        )
+        self._management_client = (
+            MLJunctionClient(
+                api_key=resolved_management_key,
+                base_url=resolved_base_url,
+                timeout=timeout,
+                app_name=app_name,
+            )
+            if resolved_management_key
+            else None
         )
 
     # -------------------------------------------------------------- reporting
@@ -217,8 +232,40 @@ class Outcomes:
         its real range so the confidence interval is computed on the scale you
         actually report.
         """
-        return self._client.put(
-            f"/v1/adaptive/outcome-definitions/{name}",
+        if self._management_client is None:
+            raise ValueError(
+                "register() requires a management key with adaptive:write scope: "
+                "pass management_api_key= or set MLJUNCTION_MANAGEMENT_API_KEY"
+            )
+        return self._management_client.put(
+            f"/v1/management/adaptive/outcome-definitions/{name}",
+            {
+                "direction": direction,
+                "display_name": display_name,
+                "description": description,
+                "lower_bound": lower_bound,
+                "upper_bound": upper_bound,
+            },
+        )
+
+    async def aregister(
+        self,
+        name: str,
+        *,
+        direction: str = "maximize",
+        display_name: str | None = None,
+        description: str | None = None,
+        lower_bound: float = 0.0,
+        upper_bound: float = 1.0,
+    ) -> dict[str, Any]:
+        """Async :meth:`register`."""
+        if self._management_client is None:
+            raise ValueError(
+                "aregister() requires a management key with adaptive:write scope: "
+                "pass management_api_key= or set MLJUNCTION_MANAGEMENT_API_KEY"
+            )
+        return await self._management_client.aput(
+            f"/v1/management/adaptive/outcome-definitions/{name}",
             {
                 "direction": direction,
                 "display_name": display_name,
@@ -230,9 +277,13 @@ class Outcomes:
 
     def close(self) -> None:
         self._client.close()
+        if self._management_client is not None:
+            self._management_client.close()
 
     async def aclose(self) -> None:
         await self._client.aclose()
+        if self._management_client is not None:
+            await self._management_client.aclose()
 
 
 def _normalized(reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
