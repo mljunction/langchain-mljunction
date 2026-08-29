@@ -67,6 +67,18 @@ class MLJunctionClient:
         _raise_for_status(response)
         return response.json()
 
+    def put(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Upsert. Used by outcome-definition registration, which is idempotent
+        by name rather than creating a new row per call."""
+        response = self.sync.put(path, json=payload)
+        _raise_for_status(response)
+        return response.json()
+
+    async def aput(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        response = await self.async_.put(path, json=payload)
+        await _araise_for_status(response)
+        return response.json()
+
     def stream(self, path: str, payload: dict[str, Any]) -> Iterator[tuple[str, dict[str, Any]]]:
         with self.sync.stream("POST", path, json=payload) as response:
             _raise_for_status(response)
