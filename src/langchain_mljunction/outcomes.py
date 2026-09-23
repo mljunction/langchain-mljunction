@@ -117,9 +117,7 @@ class Outcomes:
     ) -> None:
         resolved_key = api_key or os.environ.get("MLJUNCTION_API_KEY")
         if not resolved_key:
-            raise ValueError(
-                "an API key is required: pass api_key= or set MLJUNCTION_API_KEY"
-            )
+            raise ValueError("an API key is required: pass api_key= or set MLJUNCTION_API_KEY")
         resolved_base_url = base_url or os.environ.get("MLJUNCTION_BASE_URL") or DEFAULT_BASE_URL
         self._client = MLJunctionClient(
             api_key=resolved_key,
