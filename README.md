@@ -217,6 +217,53 @@ Every `AIMessage` carries standard `usage_metadata`. `response_metadata` retains
 model, routing, receipt, warnings, session/task/app identity, and reasoning state—nothing important
 is discarded to imitate another provider.
 
+## Reporting outcomes
+
+An adaptive model learns which candidate to route to from evidence. Besides offline
+evaluation suites, your application can report what actually happened afterwards: a
+ticket closing, a patch passing its tests, a meeting getting booked. ML Junction never
+interprets a metric's name; it compares each one against itself across the models in a
+pool.
+
+```python
+from langchain_mljunction import ChatMLJunction, Outcomes, request_id_of
+
+# One-time: register each metric name. Needs a management key with adaptive:write
+# (management_api_key= or MLJUNCTION_MANAGEMENT_API_KEY).
+outcomes = Outcomes()
+outcomes.register("resolved", direction="maximize")
+outcomes.register("csat", direction="maximize", lower_bound=1, upper_bound=5)
+
+# A support ticket: many requests, one outcome, so report it on the session.
+chat = ChatMLJunction(model="support-agent", session_id="ticket_8842")
+reply = chat.invoke("I want a refund")
+
+receipt = outcomes.report(
+    session_id="ticket_8842",
+    event_id="ticket_8842_closed",          # your idempotency key
+    metrics={"resolved": True, "csat": 4.8},
+)
+print(receipt.accepted, receipt.duplicates, receipt.discarded)
+
+# One-shot work is reported on the request itself.
+outcomes.report(request_id=request_id_of(reply), event_id="evt_1", metrics={"resolved": True})
+```
+
+Three rules:
+
+- **Register a name before sending it.** An unregistered name is refused, so a typo
+  cannot quietly become a second metric.
+- **`event_id` is required and is yours.** A report retried by a queue is counted once
+  (`receipt.duplicates`), not twice.
+- **Report against exactly one target**: `request_id`, `session_id` or `task_id`,
+  whichever unit the outcome is about.
+
+Reporting uses the ordinary inference key. Queue-flushed reports go in one round trip
+with `report_batch([...])`, where each entry takes the same arguments as `report`. Pass
+`observed_at=` when the event happened earlier than the call. `areport`,
+`areport_batch` and `aregister` are the async forms. `discarded` in the receipt is not
+an error: it counts outcomes that could not be attributed to a single candidate.
+
 ## Errors and transport lifecycle
 
 API failures raise `MLJunctionAPIError` with the HTTP status and ML Junction error payload. Streaming
