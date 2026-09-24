@@ -68,7 +68,7 @@ class MLJunction:
         self,
         *,
         api_key: str,
-        base_url: str = "http://localhost:8001",
+        base_url: str = "https://api.mljunction.com",
         app_id: str | None = None,
         app_name: str | None = None,
         environment: str = "production",

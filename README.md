@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/assets/readme-hero.png" alt="langchain-mljunction - LangChain, routed" width="100%"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/mljunction/langchain-mljunction/master/docs/assets/readme-hero.png" alt="langchain-mljunction - LangChain, routed" width="100%"></p>
 
 # langchain-mljunction
 
@@ -8,17 +8,15 @@ Junction's routing, governance, privacy, billing, and observability features.
 
 ## Install
 
-Until the package is published, install it from a checkout:
+```bash
+pip install langchain-mljunction
+```
+
+For local SDK development, from a checkout:
 
 ```bash
 git clone https://github.com/mljunction/langchain-mljunction.git
 cd langchain-mljunction
-pip install .
-```
-
-For local SDK development:
-
-```bash
 pip install -e ".[test]"
 ```
 
@@ -29,8 +27,8 @@ pip install "langchain-mljunction[otel]"
 ```
 
 Set `MLJUNCTION_API_KEY` and optionally `MLJUNCTION_BASE_URL`, or pass both to the constructor.
-The default base URL is `http://localhost:8001`, so the SDK works directly with a local ML Junction
-server.
+The default base URL is `https://api.mljunction.com`. Point `MLJUNCTION_BASE_URL` at
+`http://localhost:8001` to use a local ML Junction server instead.
 
 ## Start in 30 seconds
 
@@ -39,7 +37,6 @@ from langchain_mljunction import ChatMLJunction
 
 llm = ChatMLJunction(
     model="gpt-5-mini",
-    base_url="http://localhost:8001",
     routing={
         "strategy": "balanced",
         "service_tier": "auto",

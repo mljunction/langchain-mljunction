@@ -4,11 +4,31 @@ version = "0.1.0"
 description = "Native LangChain integration for the ML Junction gateway"
 readme = "README.md"
 requires-python = ">=3.10,<4"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "ML Junction", email = "mail@mljunction.com" }]
+keywords = ["langchain", "llm", "llm-router", "llm-gateway", "mljunction"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "httpx>=0.27,<1",
     "langchain-core>=0.3.70,<2",
     "pydantic>=2.9,<3",
 ]
+
+[project.urls]
+Homepage = "https://mljunction.com"
+Repository = "https://github.com/mljunction/langchain-mljunction"
+Issues = "https://github.com/mljunction/langchain-mljunction/issues"
 
 [project.optional-dependencies]
 otel = [

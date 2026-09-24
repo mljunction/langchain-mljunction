@@ -17,7 +17,7 @@ class MLJunctionEmbeddings(BaseModel, Embeddings):
         default_factory=lambda: SecretStr(os.getenv("MLJUNCTION_API_KEY", "")), repr=False
     )
     base_url: str = Field(
-        default_factory=lambda: os.getenv("MLJUNCTION_BASE_URL", "http://localhost:8001")
+        default_factory=lambda: os.getenv("MLJUNCTION_BASE_URL", "https://api.mljunction.com")
     )
     timeout: float = 120
     dimensions: int | None = None

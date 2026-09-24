@@ -1,0 +1,105 @@
+name: Release
+
+# Manual only: Actions > Release > Run workflow.
+# Builds the package from the chosen ref and uploads it to PyPI. The version published is
+# whatever pyproject.toml says at that ref, so bump it (and __init__.py) before running.
+# Upload uses PyPI Trusted Publishing (OIDC), so no API token is stored in this repo.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit SHA to release"
+        type: string
+        default: master
+
+# One release at a time, and never cancel one midway.
+concurrency:
+  group: release-pypi
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Every step below runs inside this image (Astral's official uv + Python), not on
+    # the runner, so nothing about the build depends on what Ubuntu happens to ship.
+    container: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Check the version is consistent and not already on PyPI
+        id: version
+        run: |
+          set -eu
+          project=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          module=$(grep -m1 '^__version__ = ' src/langchain_mljunction/__init__.py | cut -d'"' -f2)
+          echo "pyproject.toml=$project __init__.py=$module"
+          if [ "$project" != "$module" ]; then
+            echo "::error::pyproject.toml ($project) and __init__.py ($module) disagree. Bump both."
+            exit 1
+          fi
+          # PyPI never accepts the same version twice, so fail here, before the tests,
+          # rather than at the upload.
+          status=$(python -c "import sys, urllib.request, urllib.error
+          try:
+              urllib.request.urlopen('https://pypi.org/pypi/langchain-mljunction/$project/json')
+              print('taken')
+          except urllib.error.HTTPError as e:
+              print('free' if e.code == 404 else f'error {e.code}')")
+          if [ "$status" != "free" ]; then
+            echo "::error::Version $project is not publishable on PyPI ($status). Bump the version."
+            exit 1
+          fi
+          echo "version=$project" >> "$GITHUB_OUTPUT"
+
+      - run: uv sync --locked
+      # Live tests skip themselves: no RUN_LIVE_PROVIDER_TESTS or LIVE_API_KEY here.
+      - run: uv run pytest -q
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The PyPI trusted publisher is bound to this environment name. Required reviewers
+    # set on it in repo settings become an approval gate before the upload.
+    environment:
+      name: pypi
+      url: https://pypi.org/project/langchain-mljunction/${{ needs.build.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  summary:
+    needs: [build, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          {
+            echo "### Release to PyPI"
+            echo ""
+            echo "- Ref: \`${{ inputs.ref }}\`"
+            echo "- Version: ${{ needs.build.outputs.version || 'unknown' }}"
+            echo "- Build: ${{ needs.build.result }}"
+            echo "- Publish: ${{ needs.publish.result }}"
+          } >> "$GITHUB_STEP_SUMMARY"
