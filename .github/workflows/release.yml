@@ -3,7 +3,7 @@ name: Release
 # Manual only: Actions > Release > Run workflow.
 # Builds the package from the chosen ref and uploads it to PyPI. The version published is
 # whatever pyproject.toml says at that ref, so bump it (and __init__.py) before running.
-# Upload uses PyPI Trusted Publishing (OIDC), so no API token is stored in this repo.
+# Upload uses a PyPI API token stored as the PYPI_API_TOKEN secret on the `pypi` environment.
 on:
   workflow_dispatch:
     inputs:
@@ -74,19 +74,19 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # The PyPI trusted publisher is bound to this environment name. Required reviewers
-    # set on it in repo settings become an approval gate before the upload.
+    # PYPI_API_TOKEN lives on this environment, so only this job can read it, and only
+    # after any required reviewers set on the environment have approved the run.
     environment:
       name: pypi
       url: https://pypi.org/project/langchain-mljunction/${{ needs.build.outputs.version }}/
-    permissions:
-      id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
 
   summary:
     needs: [build, publish]
