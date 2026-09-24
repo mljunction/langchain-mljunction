@@ -2,7 +2,7 @@ name: Release
 
 # Manual only: Actions > Release > Run workflow.
 # Builds the package from the chosen ref and uploads it to PyPI. The version published is
-# whatever pyproject.toml says at that ref, so bump it (and __init__.py) before running.
+# whatever pyproject.toml says at that ref, so bump it there before running.
 # Upload uses a PyPI API token stored as the PYPI_API_TOKEN secret on the `pypi` environment.
 on:
   workflow_dispatch:
@@ -35,17 +35,13 @@ jobs:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
-      - name: Check the version is consistent and not already on PyPI
+      - name: Check the version is not already on PyPI
         id: version
         run: |
           set -eu
+          # pyproject.toml is the only place the version is set; __init__.py reads it back.
           project=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
-          module=$(grep -m1 '^__version__ = ' src/langchain_mljunction/__init__.py | cut -d'"' -f2)
-          echo "pyproject.toml=$project __init__.py=$module"
-          if [ "$project" != "$module" ]; then
-            echo "::error::pyproject.toml ($project) and __init__.py ($module) disagree. Bump both."
-            exit 1
-          fi
+          echo "pyproject.toml=$project"
           # PyPI never accepts the same version twice, so fail here, before the tests,
           # rather than at the upload.
           status=$(python -c "import sys, urllib.request, urllib.error

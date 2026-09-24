@@ -1,5 +1,7 @@
 """LangChain integrations for ML Junction."""
 
+from importlib.metadata import version
+
 from langchain_mljunction._client import MLJunctionAPIError
 from langchain_mljunction.chat_models import ChatMLJunction
 from langchain_mljunction.embeddings import MLJunctionEmbeddings
@@ -25,4 +27,5 @@ __all__ = [
     "expose_agent_as_tool",
     "request_id_of",
 ]
-__version__ = "0.1.0"
+# Read from the installed package metadata, so pyproject.toml is the only place to bump.
+__version__ = version("langchain-mljunction")
