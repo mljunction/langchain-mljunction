@@ -3,7 +3,7 @@
 # langchain-mljunction
 
 The native LangChain integration for ML Junction. It calls `/v1/responses` and `/v1/embeddings`
-directly—there is no `ChatOpenAI` wrapper and no vendor-shaped ceiling between your chain and ML
+directly. There is no `ChatOpenAI` wrapper and no vendor-shaped ceiling between your chain and ML
 Junction's routing, governance, privacy, billing, and observability features.
 
 ## Install
@@ -211,7 +211,7 @@ Set `export_inflight=True` only when debugging hung agents; it emits an extra
 start snapshot for each span and is off by default.
 
 Every `AIMessage` carries standard `usage_metadata`. `response_metadata` retains request ID,
-model, routing, receipt, warnings, session/task/app identity, and reasoning state—nothing important
+model, routing, receipt, warnings, session/task/app identity, and reasoning state. Nothing important
 is discarded to imitate another provider.
 
 ## Reporting outcomes
