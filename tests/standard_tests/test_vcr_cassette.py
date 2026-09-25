@@ -9,7 +9,8 @@ CASSETTE = (
 
 def test_stream_timing_cassette_is_sanitized() -> None:
     raw = CASSETTE.read_text(encoding="utf-8")
-    assert "astro_test_" not in raw
+    for key_prefix in ("mlj_live_", "mlj_test_", "mlj_mgmt_"):
+        assert key_prefix not in raw
     assert "Bearer " not in raw
     assert "password" not in raw.lower()
     assert "secret" not in raw.lower()
