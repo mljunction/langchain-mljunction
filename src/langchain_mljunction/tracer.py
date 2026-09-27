@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import itertools
 import json
 import re
 import threading
@@ -86,6 +87,20 @@ def _should_redact(key: str) -> bool:
 _SECRET_TEXT = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+|\b(sk-[A-Za-z0-9_-]{12,})\b")
 
 
+def redact_text(text: str, max_length: int = 20_000) -> str:
+    """Mask credentials in free text and cap its length.
+
+    Every text that can leave the process goes through here: string values,
+    repr() fallbacks, and span status descriptions. Status used the raw
+    exception message before, so a bearer token in an error reached the export
+    even when the captured error attribute had it masked.
+    """
+    text = _SECRET_TEXT.sub(lambda match: f"{match.group(1) or ''}[REDACTED]", text)
+    if len(text) > max_length:
+        return text[:max_length] + "<truncated>"
+    return text
+
+
 def jsonable(
     value: Any,
     *,
@@ -97,10 +112,24 @@ def jsonable(
     """Convert arbitrary Python objects into safe JSON values.
 
     Deliberately total: every branch either returns a JSON-safe value or falls
-    through to a repr. Nothing raises. A customer's exotic object graph, a
-    __repr__ that throws, a cycle deeper than max_depth - all of these produce
-    a placeholder string rather than an exception inside a callback.
+    through to a redacted repr. Nothing raises. A customer's exotic object
+    graph, a __repr__ that throws, a cycle deeper than max_depth - all of these
+    produce a placeholder string rather than an exception inside a callback.
+
+    Bounded in work as well as output: every limit applies at every level, a
+    sequence is read only as far as the item limit, and dataclasses are walked
+    field by field rather than deep-copied first. The callback runs inline, so
+    an unbounded walk would stall the agent it is observing.
     """
+    limits = {
+        "max_depth": max_depth,
+        "max_string_length": max_string_length,
+        "max_collection_length": max_collection_length,
+    }
+
+    def inner(item: Any) -> Any:
+        return jsonable(item, depth=depth + 1, **limits)
+
     if depth > max_depth:
         return "<maximum-depth-reached>"
 
@@ -108,10 +137,7 @@ def jsonable(
         return value
 
     if isinstance(value, str):
-        value = _SECRET_TEXT.sub(lambda match: f"{match.group(1) or ''}[REDACTED]", value)
-        if len(value) > max_string_length:
-            return value[:max_string_length] + "<truncated>"
-        return value
+        return redact_text(value, max_string_length)
 
     if isinstance(value, UUID | datetime):
         return str(value)
@@ -121,21 +147,24 @@ def jsonable(
 
     if isinstance(value, BaseMessage):
         try:
-            return jsonable(value.model_dump(mode="json"), depth=depth + 1, max_depth=max_depth)
+            return inner(value.model_dump(mode="json"))
         except Exception:
-            return {"type": value.type, "content": jsonable(value.content, depth=depth + 1)}
+            return {"type": value.type, "content": inner(value.content)}
 
     if hasattr(value, "model_dump"):
         try:
-            return jsonable(value.model_dump(mode="json"), depth=depth + 1, max_depth=max_depth)
+            return inner(value.model_dump(mode="json"))
         except Exception:
             pass
 
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        try:
-            return jsonable(dataclasses.asdict(value), depth=depth + 1, max_depth=max_depth)
-        except Exception:
-            pass
+        fields = dataclasses.fields(value)
+        shown = {
+            f.name: inner(getattr(value, f.name, None)) for f in fields[:max_collection_length]
+        }
+        if len(fields) > max_collection_length:
+            shown["<truncated>"] = f"{len(fields) - max_collection_length} additional fields"
+        return shown
 
     if isinstance(value, Mapping):
         output: dict[str, Any] = {}
@@ -143,31 +172,22 @@ def jsonable(
             if index >= max_collection_length:
                 output["<truncated>"] = f"{len(value) - max_collection_length} additional entries"
                 break
-            key = str(raw_key)
-            output[key] = (
-                "<redacted>"
-                if _should_redact(key)
-                else jsonable(item, depth=depth + 1, max_depth=max_depth)
-            )
+            key = redact_text(str(raw_key), max_string_length)
+            output[key] = "<redacted>" if _should_redact(key) else inner(item)
         return output
 
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        items = list(value)
-        result: list[Any] = [
-            jsonable(item, depth=depth + 1, max_depth=max_depth)
-            for item in items[:max_collection_length]
-        ]
-        if len(items) > max_collection_length:
-            result.append(f"<truncated:{len(items) - max_collection_length}>")
+        result: list[Any] = [inner(item) for item in itertools.islice(value, max_collection_length)]
+        with contextlib.suppress(Exception):
+            if len(value) > max_collection_length:
+                result.append(f"<truncated:{len(value) - max_collection_length}>")
         return result
 
     try:
         text = repr(value)
     except Exception:
         text = f"<unserializable:{type(value).__name__}>"
-    if len(text) > max_string_length:
-        text = text[:max_string_length] + "<truncated>"
-    return text
+    return redact_text(text, max_string_length)
 
 
 def merge_numeric(target: dict[str, Any], source: Mapping[str, Any]) -> None:
@@ -268,7 +288,7 @@ def extract_llm_result(
 
 
 class _ManagedSpanProcessor:
-    """A closable processor safe to leave attached to a global provider."""
+    """A closable processor safe to leave attached to a caller-supplied provider."""
 
     def __init__(self, delegate: Any) -> None:
         self._delegate = delegate
@@ -340,6 +360,42 @@ class RunState:
     attributes: dict[str, Any] = field(default_factory=dict)
 
 
+# Correlation ids and the span attribute each travels in. Task ids used to be
+# accepted by MLJunction.context() and then dropped here.
+_CORRELATION_ATTRIBUTES = {
+    "app_id": "mlj.app.id",
+    "session_id": "mlj.session.id",
+    "task_id": "mlj.task.id",
+}
+
+# Invocation settings that describe HOW a model was called, never WHAT was
+# said. Exported always; the rest (metadata, context, output schemas, tools,
+# stop sequences) only when content capture is on.
+_OPERATIONAL_INVOCATION_KEYS = frozenset(
+    {
+        "_type",
+        "model",
+        "model_name",
+        "base_url",
+        "temperature",
+        "top_p",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "max_tokens",
+        "routing",
+        "reasoning",
+        "requirements",
+        "session_id",
+        "task_id",
+        "app_name",
+        "tool_choice",
+        "parallel_tool_calls",
+        "stream",
+    }
+)
+
+
 class MLJunctionTracer(BaseCallbackHandler):
     """Callback handler that exports a span tree to ML Junction.
 
@@ -402,21 +458,22 @@ class MLJunctionTracer(BaseCallbackHandler):
                 export_timeout_millis=10_000,
             )
         )
+        # The tracer owns a private provider and never touches the global one.
+        # Attaching to the application's global provider sent every unrelated
+        # span in the process to ML Junction, and two tracers for different
+        # tenants shared one export pipeline. Passing tracer_provider is the
+        # explicit opt-in to sharing (dual export); the caller then owns it.
+        self._owns_provider = tracer_provider is None
         provider = tracer_provider
         if provider is None:
-            current = trace.get_tracer_provider()
-            if hasattr(current, "add_span_processor"):
-                provider = current
-            else:
-                resource_attributes: dict[str, Any] = {
-                    "service.name": app_name or app_id or "langchain-mljunction",
-                    "deployment.environment.name": environment,
-                }
-                if app_id:
-                    resource_attributes["service.instance.id"] = app_id
-                    resource_attributes["mlj.app.id"] = app_id
-                provider = TracerProvider(resource=Resource.create(resource_attributes))
-                trace.set_tracer_provider(provider)
+            resource_attributes: dict[str, Any] = {
+                "service.name": app_name or app_id or "langchain-mljunction",
+                "deployment.environment.name": environment,
+            }
+            if app_id:
+                resource_attributes["service.instance.id"] = app_id
+                resource_attributes["mlj.app.id"] = app_id
+            provider = TracerProvider(resource=Resource.create(resource_attributes))
         provider.add_span_processor(processor)
         inflight_processor = None
         if export_inflight:
@@ -449,6 +506,8 @@ class MLJunctionTracer(BaseCallbackHandler):
         self._processor.shutdown()
         if self._inflight_processor is not None:
             self._inflight_processor.shutdown()
+        if self._owns_provider:
+            self._provider.shutdown()
 
     def flush(self, timeout: float = 5.0) -> bool:
         timeout_millis = max(1, int(timeout * 1000))
@@ -478,6 +537,7 @@ class MLJunctionTracer(BaseCallbackHandler):
         return {
             "app_id": metadata.get(f"{NS}.app_id", self.app_id),
             "session_id": metadata.get(f"{NS}.session_id"),
+            "task_id": metadata.get(f"{NS}.task_id"),
             "agent_name": metadata.get(f"{NS}.agent_name"),
             "agent_role": metadata.get(f"{NS}.agent_role"),
             "agent_instance_id": metadata.get(f"{NS}.agent_instance_id"),
@@ -560,12 +620,9 @@ class MLJunctionTracer(BaseCallbackHandler):
                     if key.startswith("agent_") and value is not None
                 },
                 **{
-                    {
-                        "app_id": "mlj.app.id",
-                        "session_id": "mlj.session.id",
-                    }[key]: value
+                    _CORRELATION_ATTRIBUTES[key]: value
                     for key, value in context.items()
-                    if key in {"app_id", "session_id"} and value is not None
+                    if key in _CORRELATION_ATTRIBUTES and value is not None
                 },
             }
             for key, value in (attributes or {}).items():
@@ -649,7 +706,7 @@ class MLJunctionTracer(BaseCallbackHandler):
         from opentelemetry.trace import Status, StatusCode
 
         description = (
-            f"{type(error).__name__}: {error}"[:2000]
+            redact_text(f"{type(error).__name__}: {error}", 2000)
             if self.capture_content
             else type(error).__name__
         )
@@ -660,7 +717,7 @@ class MLJunctionTracer(BaseCallbackHandler):
                 _attribute(
                     {
                         "type": type(error).__name__,
-                        "message": str(error)[:4000],
+                        "message": redact_text(str(error), 4000),
                         "stack": "".join(
                             traceback.format_exception(type(error), error, error.__traceback__)
                         )[:20_000],
@@ -758,6 +815,11 @@ class MLJunctionTracer(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         invocation = kwargs.get("invocation_params") or {}
+        exported = (
+            invocation
+            if self.capture_content
+            else {k: v for k, v in invocation.items() if k in _OPERATIONAL_INVOCATION_KEYS}
+        )
         self._start(
             run_id=run_id,
             parent_run_id=parent_run_id,
@@ -766,7 +828,7 @@ class MLJunctionTracer(BaseCallbackHandler):
             input_data=messages,
             tags=tags,
             metadata=metadata,
-            attributes={"invocation_params": jsonable(invocation)},
+            attributes={"invocation_params": jsonable(exported)},
         )
 
     def on_llm_start(
@@ -877,21 +939,20 @@ class MLJunctionTracer(BaseCallbackHandler):
     # -- agent decisions ---------------------------------------------------
 
     def on_agent_action(self, action: Any, *, run_id: UUID, **kwargs: Any) -> None:
-        self._span_event(
-            run_id=run_id,
-            name="agent_action",
-            data={
-                "tool": getattr(action, "tool", None),
-                "tool_input": getattr(action, "tool_input", None),
-            },
-        )
+        # The tool NAME is structure; its input is content, and follows the
+        # same capture policy as every other input.
+        data: dict[str, Any] = {"tool": getattr(action, "tool", None)}
+        if self.capture_content:
+            data["tool_input"] = getattr(action, "tool_input", None)
+        self._span_event(run_id=run_id, name="agent_action", data=data)
 
     def on_agent_finish(self, finish: Any, *, run_id: UUID, **kwargs: Any) -> None:
-        self._span_event(
-            run_id=run_id,
-            name="agent_finish",
-            data={"return_values": getattr(finish, "return_values", None)},
+        data = (
+            {"return_values": getattr(finish, "return_values", None)}
+            if self.capture_content
+            else {}
         )
+        self._span_event(run_id=run_id, name="agent_finish", data=data)
 
     def on_retry(self, retry_state: Any, *, run_id: UUID, **kwargs: Any) -> None:
         self._span_event(

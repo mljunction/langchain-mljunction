@@ -312,3 +312,164 @@ def test_metadata_namespace_is_prefixed(telemetry):
     config = telemetry.context(agent_name="a", metadata={"agent_name": "theirs"}).config
     assert config["metadata"]["agent_name"] == "theirs"
     assert config["metadata"][f"{NS}.agent_name"] == "a"
+
+
+def _capturing(exporter: RecordingExporter) -> MLJunctionTracer:
+    return MLJunctionTracer(
+        endpoint="http://localhost:8001",
+        api_key="mlj_test",
+        capture_content=True,
+        span_exporter=exporter,
+        tracer_provider=TracerProvider(),
+    )
+
+
+def _everything(tracer: MLJunctionTracer, exporter: RecordingExporter) -> str:
+    """Every exported attribute, event and status description, as one string."""
+    parts = []
+    for span in exported(tracer, exporter):
+        parts.append(json.dumps(dict(span.attributes), default=str))
+        parts.append(str(span.status.description))
+        for event in span.events:
+            parts.append(json.dumps(dict(event.attributes), default=str))
+    return "\n".join(parts)
+
+
+def test_agent_content_is_not_exported_when_capture_is_off(tracer, exporter):
+    run_id = uid()
+
+    class Action:
+        tool = "search"
+        tool_input: ClassVar[dict[str, str]] = {"q": "PRIVATE-QUERY"}
+
+    class Finish:
+        return_values: ClassVar[dict[str, str]] = {"output": "PRIVATE-ANSWER"}
+
+    tracer.on_chain_start({"name": "chain"}, {}, run_id=run_id)
+    tracer.on_agent_action(Action(), run_id=run_id)
+    tracer.on_agent_finish(Finish(), run_id=run_id)
+    tracer.on_chain_end({}, run_id=run_id)
+
+    dump = _everything(tracer, exporter)
+    assert "PRIVATE-QUERY" not in dump and "PRIVATE-ANSWER" not in dump
+    assert "search" in dump  # the structure is still there
+
+
+def test_invocation_metadata_is_content_when_capture_is_off(tracer, exporter):
+    run_id = uid()
+    tracer.on_chat_model_start(
+        {"name": "model"},
+        [[]],
+        run_id=run_id,
+        invocation_params={"model": "m", "temperature": 0.1, "metadata": {"user": "PRIVATE-USER"}},
+    )
+    tracer.on_llm_end(LLMResult(generations=[[]]), run_id=run_id)
+
+    dump = _everything(tracer, exporter)
+    assert "PRIVATE-USER" not in dump
+    assert '\\"temperature\\":0.1' in dump
+
+
+def test_task_id_is_attributed(tracer, exporter, telemetry):
+    context = telemetry.context(agent_name="root", task_id="task-7")
+    run_id = uid()
+    tracer.on_chain_start({"name": "root"}, {}, run_id=run_id, metadata=context.config["metadata"])
+    tracer.on_chain_end({}, run_id=run_id)
+    assert by_name(tracer, exporter, "root").attributes["mlj.task.id"] == "task-7"
+
+
+def test_secrets_in_errors_are_redacted_in_the_status_too(exporter):
+    tracer = _capturing(exporter)
+    try:
+        run_id = uid()
+        tracer.on_tool_start({"name": "tool"}, "x", run_id=run_id)
+        tracer.on_tool_error(
+            RuntimeError("upstream said: Authorization: Bearer abcDEF123456789"), run_id=run_id
+        )
+        dump = _everything(tracer, exporter)
+        assert "abcDEF123456789" not in dump
+        assert "[REDACTED]" in by_name(tracer, exporter, "tool").status.description
+    finally:
+        tracer.close()
+
+
+def test_repr_fallback_is_redacted():
+    class Leaky:
+        def __repr__(self) -> str:
+            return "Leaky(key=sk-abcdefghijklmnopqrstu)"
+
+    assert "sk-abcdefghijklmnop" not in jsonable(Leaky())
+
+
+def test_serialization_work_is_bounded():
+    reads = 0
+
+    class Counting(list):
+        def __getitem__(self, index):
+            nonlocal reads
+            reads += 1
+            return super().__getitem__(index)
+
+        def __iter__(self):
+            for index in range(len(self)):
+                yield self[index]
+
+    result = jsonable(Counting(range(10_000)), max_collection_length=1)
+    assert reads <= 2
+    assert result[0] == 0
+    # Nested levels keep the caller's limits.
+    assert jsonable({"a": ["x" * 10]}, max_string_length=3) == {"a": ["xxx<truncated>"]}
+
+
+def test_unrelated_application_spans_never_reach_the_exporter(exporter, monkeypatch):
+    from opentelemetry import trace
+
+    app_provider = TracerProvider()
+    monkeypatch.setattr(trace, "get_tracer_provider", lambda: app_provider)
+
+    def refuse(_provider: Any) -> None:
+        raise AssertionError("the tracer must not replace the global provider")
+
+    monkeypatch.setattr(trace, "set_tracer_provider", refuse)
+    tracer = MLJunctionTracer(
+        endpoint="http://localhost:8001", api_key="mlj_test", span_exporter=exporter
+    )
+    try:
+        app_provider.get_tracer("someone-else").start_span("unrelated").end()
+        run_id = uid()
+        tracer.on_chain_start({"name": "ours"}, {}, run_id=run_id)
+        tracer.on_chain_end({}, run_id=run_id)
+        assert [span.name for span in exported(tracer, exporter)] == ["ours"]
+    finally:
+        tracer.close()
+
+
+def test_two_tracers_are_isolated_and_close_independently():
+    first_exporter, second_exporter = RecordingExporter(), RecordingExporter()
+    first = MLJunctionTracer(
+        endpoint="http://localhost:8001", api_key="mlj_a", span_exporter=first_exporter
+    )
+    second = MLJunctionTracer(
+        endpoint="http://localhost:8001", api_key="mlj_b", span_exporter=second_exporter
+    )
+    try:
+        first_run = uid()
+        first.on_chain_start({"name": "tenant-a"}, {}, run_id=first_run)
+        first.on_chain_end({}, run_id=first_run)
+        first.close()
+
+        second_run = uid()
+        second.on_chain_start({"name": "tenant-b"}, {}, run_id=second_run)
+        second.on_chain_end({}, run_id=second_run)
+        assert [span.name for span in first_exporter.spans] == ["tenant-a"]
+        assert [span.name for span in exported(second, second_exporter)] == ["tenant-b"]
+    finally:
+        second.close()
+
+
+def test_facade_does_not_capture_content_by_default():
+    telemetry = MLJunction(api_key="mlj_test", base_url="http://localhost:8001")
+    try:
+        assert telemetry.tracer.capture_content is False
+    finally:
+        telemetry.close()

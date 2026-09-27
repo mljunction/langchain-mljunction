@@ -72,7 +72,7 @@ class MLJunction:
         app_id: str | None = None,
         app_name: str | None = None,
         environment: str = "production",
-        capture_content: bool = True,
+        capture_content: bool = False,
         export_inflight: bool = False,
         tracer: MLJunctionTracer | None = None,
     ) -> None:

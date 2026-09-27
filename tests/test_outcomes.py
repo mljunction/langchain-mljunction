@@ -1,6 +1,6 @@
 """Outcome reporting: the addressing rules and the idempotency key."""
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import ClassVar
 
 import pytest
@@ -67,7 +67,7 @@ class TestObservedAt:
     def test_it_is_sent_as_iso_when_the_event_predates_the_call(self) -> None:
         """A ticket that closed at 11:30 belongs in the 11:30 window even if the
         queue only flushed at 13:42."""
-        when = datetime(2026, 8, 27, 11, 30, tzinfo=UTC)
+        when = datetime(2026, 8, 27, 11, 30, tzinfo=timezone.utc)
         assert _payload(**_valid(observed_at=when))["observed_at"] == when.isoformat()
 
 

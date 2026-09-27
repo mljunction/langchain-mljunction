@@ -177,6 +177,11 @@ high_effort = llm.invoke(
 Use a stable `session_id` for related requests when you want sticky routing and coherent request
 grouping in ML Junction's activity logs.
 
+Per-call `temperature`, `top_p`, `seed`, `frequency_penalty`, `presence_penalty` and `stop` go into
+`sampling`, and `max_tokens` into `output`. Section arguments such as `output={...}` or
+`routing={...}` merge with the constructor's values key by key, so overriding one setting keeps the
+others. Passing `None` leaves the configured value in place.
+
 ## Embeddings
 
 ```python
@@ -205,8 +210,12 @@ agent.invoke({"messages": [...]}, config=run.config)
 telemetry.flush()
 ```
 
-The callback bridge emits standard OTLP spans to `/v1/traces`, reuses an
-existing global OpenTelemetry provider when present, and supports dual export.
+The callback bridge emits standard OTLP spans to `/v1/traces` from its own
+OpenTelemetry provider. It never touches the global provider, so the rest of
+your application's spans are not sent to ML Junction. For dual export, build
+`MLJunctionTracer(..., tracer_provider=your_provider)` and pass it as
+`MLJunction(tracer=...)`. Inputs, outputs and error details are left off spans
+unless you set `capture_content=True`.
 Set `export_inflight=True` only when debugging hung agents; it emits an extra
 start snapshot for each span and is off by default.
 
@@ -265,6 +274,11 @@ an error: it counts outcomes that could not be attributed to a single candidate.
 
 API failures raise `MLJunctionAPIError` with the HTTP status and ML Junction error payload. Streaming
 errors are read and decoded before the exception is raised, for both sync and async clients.
+
+A stream only counts as complete when the gateway says so. If it reports a failure part way through,
+or the connection ends before the answer is finished, `stream()` and `astream()` raise
+`MLJunctionStreamError` instead of returning a truncated answer. `partial` says whether some output
+had already arrived, and `request_id` identifies the request in your activity log.
 
 Long-lived applications should close the owned HTTP transports:
 

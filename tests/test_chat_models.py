@@ -224,13 +224,17 @@ def test_bind_tools_forwards_parallel_control_as_native_field() -> None:
 
 def test_structured_json_stream_produces_a_langchain_generation() -> None:
     model = ChatMLJunction(model="test-model", api_key="test-key")
+    # As the gateway sends it: the object, then the terminal frame.
     model._client.stream = lambda *_args, **_kwargs: iter(
-        [("response.output_json.done", {"object": {"ok": True}})]
+        [
+            ("response.output_json.done", {"object": {"ok": True}}),
+            ("response.completed", {"id": "resp_1", "model": "test-model", "output": []}),
+        ]
     )
 
     chunks = list(model._stream([HumanMessage(content="Return JSON")]))
 
-    assert len(chunks) == 1
+    assert len(chunks) == 2
     assert chunks[0].message.content == '{"ok":true}'
 
 
@@ -359,12 +363,13 @@ async def test_async_structured_json_stream_produces_a_langchain_generation() ->
     async def events():
         yield "response.output_json.done", {"object": {"ok": True}}
         await asyncio.sleep(0)
+        yield "response.completed", {"id": "resp_1", "model": "test-model", "output": []}
 
     model._client.astream = lambda *_args, **_kwargs: events()
 
     chunks = [chunk async for chunk in model._astream([HumanMessage(content="Return JSON")])]
 
-    assert len(chunks) == 1
+    assert len(chunks) == 2
     assert chunks[0].message.content == '{"ok":true}'
 
 

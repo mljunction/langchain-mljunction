@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import AsyncIterator, Iterator, Sequence
@@ -12,6 +13,7 @@ from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     BaseMessage,
+    ChatMessage,
     HumanMessage,
     SystemMessage,
     ToolMessage,
@@ -28,7 +30,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_core.utils.pydantic import is_basemodel_subclass
 from pydantic import ConfigDict, Field, PrivateAttr, SecretStr
 
-from langchain_mljunction._client import MLJunctionClient
+from langchain_mljunction._client import MLJunctionClient, MLJunctionStreamError
 
 
 def _data_url(data: str, media_type: str) -> str:
@@ -83,6 +85,22 @@ def _content(content: Any) -> Any:
                     "file_id": block.get("file_id") or file.get("file_id"),
                     "file_url": block.get("url") or file.get("file_url"),
                     "filename": block.get("filename") or file.get("filename"),
+                    "media_type": media_type,
+                }
+            )
+        elif kind == "document":
+            # Anthropic-style document block: a file, not text. Serialising it
+            # into the prompt as JSON handed the model the envelope instead of
+            # the document.
+            source = block.get("source") if isinstance(block.get("source"), dict) else {}
+            media_type = source.get("media_type") or "application/pdf"
+            data = source.get("data") if source.get("type") in {None, "base64"} else None
+            normalized.append(
+                {
+                    "type": "file",
+                    "data": _data_url(str(data), str(media_type)) if data else None,
+                    "file_url": source.get("url") if source.get("type") == "url" else None,
+                    "filename": block.get("title"),
                     "media_type": media_type,
                 }
             )
@@ -142,7 +160,31 @@ def _message(message: BaseMessage) -> dict[str, Any]:
                 for call in message.tool_calls
             ]
         return value
-    return {"role": message.type, "content": message.content}
+    if isinstance(message, ChatMessage):
+        # A generic message carries its role explicitly; its `type` is "chat",
+        # which the gateway would reject as a role.
+        role = _CHAT_ROLES.get(message.role.lower())
+        if role is None:
+            raise ValueError(
+                f"ChatMessage role {message.role!r} is not supported by ML Junction; "
+                f"use one of {sorted(_CHAT_ROLES)}"
+            )
+        return {
+            "role": role,
+            "content": _content(message.content),
+            **({"name": message.name} if message.name else {}),
+        }
+    raise ValueError(f"Unsupported message type for ML Junction: {type(message).__name__}")
+
+
+_CHAT_ROLES = {
+    "system": "system",
+    "developer": "developer",
+    "user": "user",
+    "human": "user",
+    "assistant": "assistant",
+    "ai": "assistant",
+}
 
 
 def _ai_message(body: dict[str, Any]) -> AIMessage:
@@ -160,34 +202,68 @@ def _ai_message(body: dict[str, Any]) -> AIMessage:
         if item["type"] in {"text", "json"}
     ]
     calls = []
+    invalid_calls = []
     for item in body.get("output", []):
         if item["type"] != "tool_call":
             continue
         call = item["tool_call"]
         function = call["function"]
         args = function.get("arguments") or "{}"
+        if not isinstance(args, str):
+            calls.append(
+                {"name": function["name"], "args": args, "id": call.get("id"), "type": "tool_call"}
+            )
+            continue
+        try:
+            parsed = json.loads(args)
+            if not isinstance(parsed, dict):
+                raise ValueError("tool arguments must be a JSON object")
+        except ValueError as exc:
+            # Kept as an invalid call, not raised: the rest of the answer (text,
+            # usage, request id, receipt) is still real and still billed.
+            invalid_calls.append(
+                {
+                    "name": function.get("name"),
+                    "args": args,
+                    "id": call.get("id"),
+                    "error": f"Invalid tool arguments: {exc}",
+                    "type": "invalid_tool_call",
+                }
+            )
+            continue
         calls.append(
-            {
-                "name": function["name"],
-                "args": json.loads(args) if isinstance(args, str) else args,
-                "id": call.get("id"),
-                "type": "tool_call",
-            }
+            {"name": function["name"], "args": parsed, "id": call.get("id"), "type": "tool_call"}
         )
     usage = body.get("usage") or {}
+    usage_metadata: dict[str, Any] = {
+        "input_tokens": usage.get("input_tokens", 0),
+        "output_tokens": usage.get("output_tokens", 0),
+        "total_tokens": usage.get("total_tokens", 0),
+    }
+    input_details = {
+        key: value
+        for key, value in {
+            "cache_read": usage.get("cached_input_tokens"),
+            "cache_creation": usage.get("cache_write_tokens"),
+        }.items()
+        if value
+    }
+    if input_details:
+        usage_metadata["input_token_details"] = input_details
+    if usage.get("reasoning_tokens"):
+        usage_metadata["output_token_details"] = {"reasoning": usage["reasoning_tokens"]}
     return AIMessage(
         content="".join(texts),
         tool_calls=calls,
+        invalid_tool_calls=invalid_calls,
         additional_kwargs={"reasoning_details": reasoning_details},
-        usage_metadata={
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-            "total_tokens": usage.get("total_tokens", 0),
-        },
+        usage_metadata=usage_metadata,
         response_metadata={
             "id": body.get("id"),
             "model": body.get("model"),
             "model_name": body.get("model"),
+            # "length" says the answer was cut off at the output limit.
+            "finish_reason": body.get("finish_reason"),
             "routing": body.get("routing"),
             "receipt": body.get("receipt"),
             "warnings": body.get("warnings"),
@@ -239,6 +315,18 @@ def _ai_message_chunk(message: AIMessage, *, include_output: bool = True) -> AIM
             }
             for index, call in enumerate(message.tool_calls)
         ]
+        # Invalid calls keep their raw arguments; merged chunks re-derive them
+        # as invalid_tool_calls, so they are not silently dropped.
+        tool_call_chunks += [
+            {
+                "name": call.get("name"),
+                "args": call.get("args"),
+                "id": call.get("id"),
+                "index": len(message.tool_calls) + index,
+                "type": "tool_call_chunk",
+            }
+            for index, call in enumerate(message.invalid_tool_calls)
+        ]
     return AIMessageChunk(
         content=message.content if include_output else "",
         additional_kwargs=message.additional_kwargs,
@@ -246,6 +334,119 @@ def _ai_message_chunk(message: AIMessage, *, include_output: bool = True) -> AIM
         usage_metadata=message.usage_metadata,
         tool_call_chunks=tool_call_chunks,
     )
+
+
+class _StreamState:
+    """Turn gateway stream events into chunks, and insist on a successful end.
+
+    A stream is complete only when ``response.completed`` arrives. Accepting
+    EOF, or a ``response.failed`` after some text, as the end of the answer
+    returned a truncated or failed answer as if it were a whole one.
+    """
+
+    def __init__(self, model_name: str) -> None:
+        self.model_name = model_name
+        self.request_id: str | None = None
+        self.saw_output = False
+        self.completed = False
+
+    def chunk(self, event: str, data: dict[str, Any]) -> ChatGenerationChunk | None:
+        if self.completed:
+            # Nothing after the terminal frame belongs to this answer; a second
+            # "completed" would double the usage when chunks are merged.
+            return None
+        if event == "response.created":
+            self.request_id = data.get("id") or self.request_id
+            return None
+        if event == "response.failed":
+            raise MLJunctionStreamError.from_failed_event(
+                {**data, "id": data.get("id") or self.request_id}
+            )
+        if event == "response.output_text.delta":
+            self.saw_output = True
+            message = AIMessageChunk(content=data.get("delta", ""))
+        elif event == "response.output_json.done":
+            self.saw_output = True
+            message = AIMessageChunk(
+                content=json.dumps(data.get("object"), ensure_ascii=False, separators=(",", ":"))
+            )
+        elif event == "response.tool_call.delta":
+            self.saw_output = True
+            message = AIMessageChunk(
+                content="",
+                tool_call_chunks=[
+                    {
+                        "name": data.get("name"),
+                        "args": data.get("arguments", ""),
+                        "id": data.get("id"),
+                        "index": data.get("index", 0),
+                        "type": "tool_call_chunk",
+                    }
+                ],
+            )
+        elif event == "response.completed":
+            self.completed = True
+            complete = _ai_message(data)
+            if not complete.response_metadata.get("model_name"):
+                complete.response_metadata["model"] = self.model_name
+                complete.response_metadata["model_name"] = self.model_name
+            message = _ai_message_chunk(complete, include_output=False)
+        else:
+            return None
+        return ChatGenerationChunk(message=message)
+
+    def finish(self) -> None:
+        if not self.completed:
+            raise MLJunctionStreamError(
+                "The ML Junction stream ended before the answer was complete.",
+                request_id=self.request_id,
+                code="stream_incomplete",
+                retryable=True,
+                partial=self.saw_output,
+            )
+
+
+# Per-call and model_kwargs keys that belong inside a nested section of the
+# request, not at its top level (the gateway rejects unknown top-level fields).
+_SAMPLING_KEYS = frozenset(
+    {"temperature", "top_p", "seed", "frequency_penalty", "presence_penalty"}
+)
+# Sections merged key by key, so an override of one setting keeps the rest.
+_SECTIONS = frozenset(
+    {
+        "sampling",
+        "reasoning",
+        "output",
+        "cache",
+        "degradation",
+        "requirements",
+        "routing",
+        "context",
+        "metadata",
+        "compatibility",
+    }
+)
+
+
+def _apply_overrides(payload: dict[str, Any], overrides: dict[str, Any]) -> None:
+    """Merge constructor model_kwargs or per-call kwargs into a native payload.
+
+    None means "not specified" and never erases a configured value. Unknown keys
+    pass through to the top level for the gateway to validate.
+    """
+    for key, value in overrides.items():
+        if value is None:
+            continue
+        if key in _SAMPLING_KEYS or key == "stop":
+            payload["sampling"] = {**payload.get("sampling", {}), key: value}
+        elif key == "max_tokens":
+            payload["output"] = {**payload.get("output", {}), "max_tokens": value}
+        elif key in _SECTIONS:
+            if not isinstance(value, dict):
+                raise TypeError(f"{key} must be a dict, got {type(value).__name__}")
+            payload[key] = {**(payload.get(key) or {}), **value}
+        else:
+            payload[key] = value
 
 
 class ChatMLJunction(BaseChatModel):
@@ -299,7 +500,39 @@ class ChatMLJunction(BaseChatModel):
 
     @property
     def _identifying_params(self) -> dict[str, Any]:
-        return {"model": self.model, "base_url": self.base_url, "routing": self.routing}
+        """Everything that decides the answer, for LangChain's cache key.
+
+        A shared LLM cache keys on this. With only model/base_url/routing, two
+        clients with different API keys (different organisations), sessions or
+        generation settings shared entries, so one could be served the other's
+        answer. The key itself never appears: only a digest of it.
+        """
+        secret = self.api_key.get_secret_value().encode()
+        return {
+            "model": self.model,
+            "base_url": self.base_url,
+            "principal": hashlib.sha256(secret).hexdigest()[:16],
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "seed": self.seed,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+            "max_tokens": self.max_tokens,
+            "stop": self.stop,
+            "reasoning": self.reasoning,
+            "output": self.output,
+            "requirements": self.requirements,
+            "routing": self.routing,
+            "context": self.context,
+            "metadata": self.metadata,
+            "compatibility": self.compatibility,
+            "session_id": self.session_id,
+            "session_name": self.session_name,
+            "task_id": self.task_id,
+            "task_name": self.task_name,
+            "app_name": self.app_name,
+            "model_kwargs": self.model_kwargs,
+        }
 
     def _get_ls_params(self, stop: list[str] | None = None, **kwargs: Any) -> LangSmithParams:
         return LangSmithParams(
@@ -330,6 +563,8 @@ class ChatMLJunction(BaseChatModel):
     def _without_internal_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         cleaned = dict(kwargs)
         cleaned.pop("_mljunction_structured_output", None)
+        # LangChain's tracing hint; never part of the request.
+        cleaned.pop("ls_structured_output_format", None)
         return cleaned
 
     def _payload(
@@ -350,7 +585,12 @@ class ChatMLJunction(BaseChatModel):
                 "stop": effective_stop,
             },
             "reasoning": self.reasoning,
-            "output": {**self.output, "max_tokens": self.max_tokens},
+            # max_tokens only when set: an unset constructor value used to
+            # overwrite an explicit output.max_tokens with None.
+            "output": {
+                **self.output,
+                **({"max_tokens": self.max_tokens} if self.max_tokens is not None else {}),
+            },
             "requirements": self.requirements,
             "routing": self.routing,
             "context": self.context,
@@ -362,8 +602,11 @@ class ChatMLJunction(BaseChatModel):
             "task_name": self.task_name,
             "compatibility": self.compatibility,
         }
-        payload.update(self.model_kwargs)
-        payload.update(kwargs)
+        # Nested settings merge key by key, per-call over constructor, so
+        # binding output={"format": ...} keeps the configured max_tokens and a
+        # per-call temperature=... lands in sampling instead of the top level.
+        _apply_overrides(payload, self.model_kwargs)
+        _apply_overrides(payload, kwargs)
         reasoning = dict(payload.get("reasoning") or {})
         if "continuation_token" not in reasoning:
             token = _latest_continuation_token(messages)
@@ -437,41 +680,12 @@ class ChatMLJunction(BaseChatModel):
         events = self._client.stream(
             "/v1/responses", self._payload(messages, stream=True, stop=stop, **kwargs)
         )
+        state = _StreamState(kwargs.get("model", self.model))
         for event, data in events:
-            if event == "response.output_text.delta":
-                message = AIMessageChunk(content=data.get("delta", ""))
-            elif event == "response.output_json.done":
-                message = AIMessageChunk(
-                    content=json.dumps(
-                        data.get("object"),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                )
-            elif event == "response.tool_call.delta":
-                message = AIMessageChunk(
-                    content="",
-                    tool_call_chunks=[
-                        {
-                            "name": data.get("name"),
-                            "args": data.get("arguments", ""),
-                            "id": data.get("id"),
-                            "index": data.get("index", 0),
-                            "type": "tool_call_chunk",
-                        }
-                    ],
-                )
-            elif event == "response.completed":
-                complete = _ai_message(data)
-                if not complete.response_metadata.get("model_name"):
-                    model_name = kwargs.get("model", self.model)
-                    complete.response_metadata["model"] = model_name
-                    complete.response_metadata["model_name"] = model_name
-                message = _ai_message_chunk(complete, include_output=False)
-            else:
-                continue
-            chunk = ChatGenerationChunk(message=message)
-            yield chunk
+            chunk = state.chunk(event, data)
+            if chunk is not None:
+                yield chunk
+        state.finish()
 
     async def _astream(
         self,
@@ -498,41 +712,12 @@ class ChatMLJunction(BaseChatModel):
         events = self._client.astream(
             "/v1/responses", self._payload(messages, stream=True, stop=stop, **kwargs)
         )
+        state = _StreamState(kwargs.get("model", self.model))
         async for event, data in events:
-            if event == "response.output_text.delta":
-                message = AIMessageChunk(content=data.get("delta", ""))
-            elif event == "response.output_json.done":
-                message = AIMessageChunk(
-                    content=json.dumps(
-                        data.get("object"),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                )
-            elif event == "response.tool_call.delta":
-                message = AIMessageChunk(
-                    content="",
-                    tool_call_chunks=[
-                        {
-                            "name": data.get("name"),
-                            "args": data.get("arguments", ""),
-                            "id": data.get("id"),
-                            "index": data.get("index", 0),
-                            "type": "tool_call_chunk",
-                        }
-                    ],
-                )
-            elif event == "response.completed":
-                complete = _ai_message(data)
-                if not complete.response_metadata.get("model_name"):
-                    model_name = kwargs.get("model", self.model)
-                    complete.response_metadata["model"] = model_name
-                    complete.response_metadata["model_name"] = model_name
-                message = _ai_message_chunk(complete, include_output=False)
-            else:
-                continue
-            chunk = ChatGenerationChunk(message=message)
-            yield chunk
+            chunk = state.chunk(event, data)
+            if chunk is not None:
+                yield chunk
+        state.finish()
 
     def bind_tools(
         self,

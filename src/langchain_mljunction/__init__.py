@@ -2,7 +2,7 @@
 
 from importlib.metadata import version
 
-from langchain_mljunction._client import MLJunctionAPIError
+from langchain_mljunction._client import MLJunctionAPIError, MLJunctionStreamError
 from langchain_mljunction.chat_models import ChatMLJunction
 from langchain_mljunction.embeddings import MLJunctionEmbeddings
 from langchain_mljunction.outcomes import OutcomeReceipt, Outcomes, request_id_of
@@ -20,6 +20,7 @@ __all__ = [
     "MLJunction",
     "MLJunctionAPIError",
     "MLJunctionEmbeddings",
+    "MLJunctionStreamError",
     "MLJunctionTracer",
     "OutcomeReceipt",
     "Outcomes",

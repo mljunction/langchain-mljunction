@@ -29,6 +29,49 @@ class MLJunctionAPIError(RuntimeError):
         )
 
 
+class MLJunctionStreamError(RuntimeError):
+    """A stream that did not end in a successful ``response.completed``.
+
+    Raised when the gateway reports ``response.failed``, or when the connection
+    ends before any terminal event. ``partial`` is True when some output was
+    already streamed: that text is real, but it is not a complete answer.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: str | None = None,
+        code: str | None = None,
+        error_type: str | None = None,
+        status_code: int | None = None,
+        retryable: bool = False,
+        partial: bool = False,
+    ) -> None:
+        self.request_id = request_id
+        self.code = code
+        self.error_type = error_type
+        self.status_code = status_code
+        self.retryable = retryable
+        self.partial = partial
+        super().__init__(message)
+
+    @classmethod
+    def from_failed_event(cls, data: dict[str, Any]) -> MLJunctionStreamError:
+        error = data.get("error") if isinstance(data.get("error"), dict) else {}
+        code = error.get("code")
+        return cls(
+            f"ML Junction stream failed ({code or 'unknown'}): "
+            f"{error.get('message') or 'the request did not complete'}",
+            request_id=data.get("id"),
+            code=code,
+            error_type=error.get("type"),
+            status_code=error.get("status"),
+            retryable=bool(error.get("retryable")),
+            partial=bool(data.get("partial")),
+        )
+
+
 def _raise_for_status(response: httpx.Response) -> None:
     if response.is_error:
         if not response.is_closed:
