@@ -8,7 +8,7 @@ from typing import Any
 from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel, Field, PrivateAttr, SecretStr
 
-from langchain_mljunction._client import MLJunctionClient
+from langchain_mljunction._client import MLJunctionClient, bare_model_name
 
 
 class MLJunctionEmbeddings(BaseModel, Embeddings):
@@ -25,6 +25,8 @@ class MLJunctionEmbeddings(BaseModel, Embeddings):
     user: str | None = None
     routing: dict[str, Any] = Field(default_factory=dict)
     app_name: str | None = None
+    # Accept OpenRouter-style "provider/model" names by sending only "model".
+    strip_provider_prefix: bool = False
     _client: MLJunctionClient = PrivateAttr()
 
     def model_post_init(self, __context: Any) -> None:
@@ -39,7 +41,7 @@ class MLJunctionEmbeddings(BaseModel, Embeddings):
 
     def _payload(self, texts: list[str]) -> dict[str, Any]:
         return {
-            "model": self.model,
+            "model": bare_model_name(self.model) if self.strip_provider_prefix else self.model,
             "input": texts,
             "dimensions": self.dimensions,
             "encoding_format": self.encoding_format,

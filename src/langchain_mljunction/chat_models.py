@@ -17,6 +17,7 @@ from langchain_core.messages import (
     HumanMessage,
     SystemMessage,
     ToolMessage,
+    message_chunk_to_message,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import (
@@ -30,7 +31,11 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_core.utils.pydantic import is_basemodel_subclass
 from pydantic import ConfigDict, Field, PrivateAttr, SecretStr
 
-from langchain_mljunction._client import MLJunctionClient, MLJunctionStreamError
+from langchain_mljunction._client import (
+    MLJunctionClient,
+    MLJunctionStreamError,
+    bare_model_name,
+)
 
 
 def _data_url(data: str, media_type: str) -> str:
@@ -406,6 +411,18 @@ class _StreamState:
             )
 
 
+def _buffered_result(chunks: list[ChatGenerationChunk]) -> ChatResult:
+    """Merge a finished stream into the result a non-streaming call returns."""
+    merged = chunks[0].message
+    for chunk in chunks[1:]:
+        merged = merged + chunk.message
+    message = message_chunk_to_message(merged)
+    return ChatResult(
+        generations=[ChatGeneration(message=message)],
+        llm_output=message.response_metadata.get("routing"),
+    )
+
+
 # Per-call and model_kwargs keys that belong inside a nested section of the
 # request, not at its top level (the gateway rejects unknown top-level fields).
 _SAMPLING_KEYS = frozenset(
@@ -482,6 +499,13 @@ class ChatMLJunction(BaseChatModel):
     task_name: str | None = None
     app_name: str | None = None
     model_kwargs: dict[str, Any] = Field(default_factory=dict)
+    # Non-streaming calls still read the answer as a stream and return it whole.
+    # A long generation otherwise sends nothing until it finishes, and the read
+    # timeout (or a proxy's idle timeout) kills a request that was working.
+    buffered_stream: bool = True
+    # Accept OpenRouter-style "provider/model" names by sending only "model".
+    # Off by default: a name with a slash is otherwise passed through untouched.
+    strip_provider_prefix: bool = False
     _client: MLJunctionClient = PrivateAttr()
 
     def model_post_init(self, __context: Any) -> None:
@@ -607,6 +631,9 @@ class ChatMLJunction(BaseChatModel):
         # per-call temperature=... lands in sampling instead of the top level.
         _apply_overrides(payload, self.model_kwargs)
         _apply_overrides(payload, kwargs)
+        # After the overrides, so a per-call model="provider/model" is stripped too.
+        if self.strip_provider_prefix and isinstance(payload.get("model"), str):
+            payload["model"] = bare_model_name(payload["model"])
         reasoning = dict(payload.get("reasoning") or {})
         if "continuation_token" not in reasoning:
             token = _latest_continuation_token(messages)
@@ -627,6 +654,12 @@ class ChatMLJunction(BaseChatModel):
         }
         return {key: value for key, value in payload.items() if value is not None}
 
+    def _buffered(self, payload: dict[str, Any]) -> bool:
+        # The gateway honours idempotency_key on non-streaming requests only, so
+        # a keyed call stays a plain POST: buffering it would silently drop the
+        # replay protection and let a retry be charged twice.
+        return self.buffered_stream and not payload.get("idempotency_key")
+
     def _generate(
         self,
         messages: list[BaseMessage],
@@ -634,9 +667,15 @@ class ChatMLJunction(BaseChatModel):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        body = self._client.post(
-            "/v1/responses", self._payload(messages, stream=False, stop=stop, **kwargs)
-        )
+        payload = self._payload(messages, stream=False, stop=stop, **kwargs)
+        if self._buffered(payload):
+            payload["stream"] = True
+            events = self._client.stream("/v1/responses", payload)
+            state = _StreamState(kwargs.get("model", self.model))
+            chunks = [chunk for event, data in events if (chunk := state.chunk(event, data))]
+            state.finish()
+            return _buffered_result(chunks)
+        body = self._client.post("/v1/responses", payload)
         return ChatResult(
             generations=[ChatGeneration(message=_ai_message(body))], llm_output=body.get("routing")
         )
@@ -648,9 +687,15 @@ class ChatMLJunction(BaseChatModel):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
-        body = await self._client.apost(
-            "/v1/responses", self._payload(messages, stream=False, stop=stop, **kwargs)
-        )
+        payload = self._payload(messages, stream=False, stop=stop, **kwargs)
+        if self._buffered(payload):
+            payload["stream"] = True
+            events = self._client.astream("/v1/responses", payload)
+            state = _StreamState(kwargs.get("model", self.model))
+            chunks = [chunk async for event, data in events if (chunk := state.chunk(event, data))]
+            state.finish()
+            return _buffered_result(chunks)
+        body = await self._client.apost("/v1/responses", payload)
         return ChatResult(
             generations=[ChatGeneration(message=_ai_message(body))], llm_output=body.get("routing")
         )

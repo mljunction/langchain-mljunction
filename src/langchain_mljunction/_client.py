@@ -72,6 +72,11 @@ class MLJunctionStreamError(RuntimeError):
         )
 
 
+def bare_model_name(model: str) -> str:
+    """``openai/gpt-4.1-mini`` -> ``gpt-4.1-mini``, for OpenRouter-style names."""
+    return model.split("/", 1)[1] if "/" in model else model
+
+
 def _raise_for_status(response: httpx.Response) -> None:
     if response.is_error:
         if not response.is_closed:

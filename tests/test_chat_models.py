@@ -10,6 +10,7 @@ from pydantic.v1 import BaseModel as BaseModelV1
 
 from langchain_mljunction._client import (
     MLJunctionAPIError,
+    MLJunctionStreamError,
     _araise_for_status,
     _raise_for_status,
 )
@@ -239,7 +240,7 @@ def test_structured_json_stream_produces_a_langchain_generation() -> None:
 
 
 def test_bound_structured_stream_uses_one_complete_non_streaming_response() -> None:
-    model = ChatMLJunction(model="test-model", api_key="test-key")
+    model = ChatMLJunction(model="test-model", api_key="test-key", buffered_stream=False)
     model._client.stream = lambda *_args, **_kwargs: pytest.fail(
         "structured output must not use the streaming transport"
     )
@@ -341,7 +342,7 @@ def test_with_structured_output_include_raw_uses_langchain_result_contract() -> 
     class Answer(BaseModel):
         answer: str
 
-    model = ChatMLJunction(model="test-model", api_key="test-key")
+    model = ChatMLJunction(model="test-model", api_key="test-key", buffered_stream=False)
     model._client.post = lambda *_args, **_kwargs: {
         "id": "resp_1",
         "model": "test-model",
@@ -375,7 +376,7 @@ async def test_async_structured_json_stream_produces_a_langchain_generation() ->
 
 @pytest.mark.asyncio
 async def test_async_bound_structured_stream_uses_complete_response() -> None:
-    model = ChatMLJunction(model="test-model", api_key="test-key")
+    model = ChatMLJunction(model="test-model", api_key="test-key", buffered_stream=False)
 
     async def fail_stream():
         pytest.fail("structured output must not use the streaming transport")
@@ -452,3 +453,171 @@ async def test_async_streaming_transport_error_is_read_before_parsing() -> None:
 def test_base64_embedding_is_decoded_to_langchain_float_vector() -> None:
     encoded = base64.b64encode(struct.pack("<2f", 1.25, -2.5)).decode()
     assert MLJunctionEmbeddings._vector(encoded) == [1.25, -2.5]
+
+
+def _buffered_model(events: list) -> ChatMLJunction:
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+    model._client.post = lambda *_args, **_kwargs: pytest.fail(
+        "a buffered call must read the answer as a stream"
+    )
+    model._client.stream = lambda *_args, **_kwargs: iter(events)
+    return model
+
+
+def test_invoke_reads_a_stream_and_returns_one_complete_message() -> None:
+    usage = {"input_tokens": 2, "output_tokens": 2, "total_tokens": 4}
+    model = _buffered_model(
+        [
+            ("response.created", {"id": "resp_1"}),
+            ("response.output_text.delta", {"delta": "hel"}),
+            ("response.output_text.delta", {"delta": "lo"}),
+            (
+                "response.completed",
+                {
+                    "id": "resp_1",
+                    "model": "test-model",
+                    "finish_reason": "stop",
+                    "routing": {"route": "r1"},
+                    "output": [{"type": "text", "text": "hello"}],
+                    "usage": usage,
+                },
+            ),
+        ]
+    )
+
+    message = model.invoke("Say hello")
+
+    assert type(message) is AIMessage
+    assert message.content == "hello"
+    assert message.usage_metadata["total_tokens"] == 4
+    assert message.response_metadata["id"] == "resp_1"
+    assert message.response_metadata["finish_reason"] == "stop"
+    result = model._generate([HumanMessage(content="Say hello")])
+    assert result.llm_output == {"route": "r1"}
+
+
+def test_buffered_invoke_merges_streamed_tool_call_arguments() -> None:
+    model = _buffered_model(
+        [
+            (
+                "response.tool_call.delta",
+                {"index": 0, "id": "call_1", "name": "weather", "arguments": '{"city":'},
+            ),
+            ("response.tool_call.delta", {"index": 0, "arguments": '"Paris"}'}),
+            ("response.completed", {"id": "resp_1", "model": "test-model", "output": []}),
+        ]
+    )
+
+    message = model.invoke("Weather?")
+
+    assert message.tool_calls == [
+        {"name": "weather", "args": {"city": "Paris"}, "id": "call_1", "type": "tool_call"}
+    ]
+
+
+def test_buffered_structured_output_parses_the_streamed_object() -> None:
+    class Answer(BaseModel):
+        answer: str
+
+    model = _buffered_model(
+        [
+            ("response.output_json.done", {"object": {"answer": "yes"}}),
+            ("response.completed", {"id": "resp_1", "model": "test-model", "output": []}),
+        ]
+    )
+
+    assert model.with_structured_output(Answer).invoke("Answer") == Answer(answer="yes")
+
+
+def test_buffered_invoke_raises_on_a_failed_stream() -> None:
+    model = _buffered_model(
+        [
+            ("response.output_text.delta", {"delta": "partial"}),
+            ("response.failed", {"id": "resp_1", "error": {"code": "upstream_error"}}),
+        ]
+    )
+
+    with pytest.raises(MLJunctionStreamError, match="upstream_error"):
+        model.invoke("Hi")
+
+
+def test_buffered_invoke_never_returns_a_truncated_answer() -> None:
+    model = _buffered_model([("response.output_text.delta", {"delta": "partial"})])
+
+    with pytest.raises(MLJunctionStreamError) as error:
+        model.invoke("Hi")
+    assert error.value.code == "stream_incomplete"
+    assert error.value.partial is True
+
+
+@pytest.mark.asyncio
+async def test_async_invoke_reads_a_stream_and_returns_one_complete_message() -> None:
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+
+    async def post(*_args, **_kwargs):
+        pytest.fail("a buffered call must read the answer as a stream")
+
+    async def events():
+        yield "response.output_text.delta", {"delta": "o"}
+        await asyncio.sleep(0)
+        yield "response.output_text.delta", {"delta": "k"}
+        yield "response.completed", {"id": "resp_1", "model": "test-model", "output": []}
+
+    model._client.apost = post
+    model._client.astream = lambda *_args, **_kwargs: events()
+
+    message = await model.ainvoke("Reply OK")
+
+    assert type(message) is AIMessage
+    assert message.content == "ok"
+
+
+def test_provider_prefix_is_kept_by_default() -> None:
+    model = ChatMLJunction(model="openai/gpt-4.1-mini", api_key="test-key")
+    payload = model._payload([HumanMessage(content="hi")], stream=False, stop=None)
+    assert payload["model"] == "openai/gpt-4.1-mini"
+
+
+def test_provider_prefix_is_stripped_when_enabled() -> None:
+    model = ChatMLJunction(
+        model="openai/gpt-4.1-mini", api_key="test-key", strip_provider_prefix=True
+    )
+    messages = [HumanMessage(content="hi")]
+
+    assert model._payload(messages, stream=False, stop=None)["model"] == "gpt-4.1-mini"
+    # A per-call override is stripped too.
+    override = model._payload(messages, stream=False, stop=None, model="google/gemini-3.5-flash")
+    assert override["model"] == "gemini-3.5-flash"
+    # A bare name is left alone.
+    bare = ChatMLJunction(model="gpt-5", api_key="test-key", strip_provider_prefix=True)
+    assert bare._payload(messages, stream=False, stop=None)["model"] == "gpt-5"
+
+
+def test_embeddings_strip_provider_prefix_only_when_enabled() -> None:
+    kept = MLJunctionEmbeddings(model="openai/text-embedding-3-small", api_key="test-key")
+    stripped = MLJunctionEmbeddings(
+        model="openai/text-embedding-3-small", api_key="test-key", strip_provider_prefix=True
+    )
+    assert kept._payload(["x"])["model"] == "openai/text-embedding-3-small"
+    assert stripped._payload(["x"])["model"] == "text-embedding-3-small"
+
+
+@pytest.mark.parametrize("where", ["constructor", "per_call"])
+def test_idempotency_key_keeps_a_plain_post_so_replay_protection_holds(where: str) -> None:
+    kwargs = {"idempotency_key": "ticket-1"} if where == "constructor" else {}
+    model = ChatMLJunction(model="test-model", api_key="test-key", **kwargs)
+    model._client.stream = lambda *_args, **_kwargs: pytest.fail(
+        "an idempotent request must not be streamed"
+    )
+    sent = {}
+
+    def post(_path, payload):
+        sent.update(payload)
+        return {"id": "resp_1", "model": "test-model", "output": [{"type": "text", "text": "ok"}]}
+
+    model._client.post = post
+    call_kwargs = {"idempotency_key": "ticket-1"} if where == "per_call" else {}
+
+    assert model.invoke("Hi", **call_kwargs).content == "ok"
+    assert sent["stream"] is False
+    assert sent["idempotency_key"] == "ticket-1"
