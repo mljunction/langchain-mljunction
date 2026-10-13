@@ -269,6 +269,9 @@ def _ai_message(body: dict[str, Any]) -> AIMessage:
             "model_name": body.get("model"),
             # "length" says the answer was cut off at the output limit.
             "finish_reason": body.get("finish_reason"),
+            # The provider's own word for it, None when the gateway does not
+            # have it; finish_reason is the same vocabulary on every model.
+            "native_finish_reason": body.get("native_finish_reason"),
             "routing": body.get("routing"),
             "receipt": body.get("receipt"),
             "warnings": body.get("warnings"),

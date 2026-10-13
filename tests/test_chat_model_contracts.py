@@ -135,6 +135,7 @@ def test_malformed_tool_arguments_become_an_invalid_call_not_a_crash() -> None:
         {
             "id": "resp_1",
             "finish_reason": "length",
+            "native_finish_reason": "MAX_TOKENS",
             "output": [
                 {"type": "text", "text": "partial"},
                 {
@@ -155,6 +156,7 @@ def test_malformed_tool_arguments_become_an_invalid_call_not_a_crash() -> None:
     assert message.invalid_tool_calls[0]["args"] == '{"a": '
     assert message.response_metadata["id"] == "resp_1"
     assert message.response_metadata["finish_reason"] == "length"
+    assert message.response_metadata["native_finish_reason"] == "MAX_TOKENS"
     assert message.usage_metadata["input_token_details"] == {"cache_read": 2}
     assert message.usage_metadata["output_token_details"] == {"reasoning": 5}
 

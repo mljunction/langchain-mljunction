@@ -477,6 +477,7 @@ def test_invoke_reads_a_stream_and_returns_one_complete_message() -> None:
                     "id": "resp_1",
                     "model": "test-model",
                     "finish_reason": "stop",
+                    "native_finish_reason": "end_turn",
                     "routing": {"route": "r1"},
                     "output": [{"type": "text", "text": "hello"}],
                     "usage": usage,
@@ -492,6 +493,7 @@ def test_invoke_reads_a_stream_and_returns_one_complete_message() -> None:
     assert message.usage_metadata["total_tokens"] == 4
     assert message.response_metadata["id"] == "resp_1"
     assert message.response_metadata["finish_reason"] == "stop"
+    assert message.response_metadata["native_finish_reason"] == "end_turn"
     result = model._generate([HumanMessage(content="Say hello")])
     assert result.llm_output == {"route": "r1"}
 
