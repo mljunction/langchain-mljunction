@@ -1,6 +1,6 @@
 [project]
 name = "langchain-mljunction"
-version = "0.1.2"
+version = "0.2.0"
 description = "Native LangChain integration for the ML Junction gateway"
 readme = "README.md"
 requires-python = ">=3.10,<4"
