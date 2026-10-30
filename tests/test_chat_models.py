@@ -169,6 +169,37 @@ def test_tool_result_continuation_survives_trailing_workflow_context() -> None:
     assert payload["reasoning"]["input_type"] == "tool_results"
 
 
+def test_token_from_an_earlier_turn_is_not_sent_with_a_newer_turn() -> None:
+    # The newer turn came from another gateway after a failover: it carries that
+    # gateway's reasoning and no ML Junction token.
+    mlj_turn = AIMessage(
+        content="",
+        tool_calls=[{"name": "weather", "args": {}, "id": "call_1"}],
+        response_metadata={"reasoning": {"continuation_token": "gwrt_v3.a-valid-long-token"}},
+    )
+    other_turn = AIMessage(
+        content="",
+        tool_calls=[{"name": "weather", "args": {}, "id": "call_2"}],
+        additional_kwargs={
+            "reasoning_details": [{"type": "reasoning.encrypted", "data": "opaque"}]
+        },
+    )
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+    payload = model._payload(
+        [
+            HumanMessage(content="weather in two cities?"),
+            mlj_turn,
+            ToolMessage(content="sunny", tool_call_id="call_1"),
+            other_turn,
+            ToolMessage(content="rain", tool_call_id="call_2"),
+        ],
+        stream=False,
+        stop=None,
+    )
+    assert "continuation_token" not in payload["reasoning"]
+    assert "input_type" not in payload["reasoning"]
+
+
 def test_payload_uses_native_routing_controls() -> None:
     model = ChatMLJunction(
         model="test-model",

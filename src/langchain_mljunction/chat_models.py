@@ -286,13 +286,18 @@ def _ai_message(body: dict[str, Any]) -> AIMessage:
 
 
 def _latest_continuation_token(messages: list[BaseMessage]) -> str | None:
+    """The token of the newest assistant turn, or None if that turn has none.
+
+    A token continues the turn that issued it. Looking further back would pair an
+    older turn's token with a newer turn's reasoning (one served by another
+    gateway, or rebuilt by the caller), which providers reject.
+    """
     for message in reversed(messages):
         if not isinstance(message, AIMessage):
             continue
         reasoning = message.response_metadata.get("reasoning") or {}
         token = reasoning.get("continuation_token")
-        if isinstance(token, str) and token:
-            return token
+        return token if isinstance(token, str) and token else None
     return None
 
 

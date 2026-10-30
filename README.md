@@ -81,6 +81,12 @@ automatically supplied with the next full message history. Pass
 `reasoning={"continuation_token": None}` to intentionally abandon replay for a fork. The token
 contains routing affinity only; it does not contain conversation history, reasoning, or credentials.
 
+Only the newest assistant message's token is sent. If that message has none (it was served by
+another gateway, rebuilt by your code, or came from a live stream), no token is sent and the turn
+continues from visible history. Live streams do not return a token: continuing native reasoning
+needs the provider's terminal state, so the gateway issues tokens only for `invoke` and for streams
+with `output={"streaming_mode": "buffered"}`.
+
 ## Tools, structured output, and streaming
 
 ```python
