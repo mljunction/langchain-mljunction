@@ -24,6 +24,7 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables.config import ensure_config
 
+from langchain_mljunction import autotrace
 from langchain_mljunction.tracer import NS, MLJunctionTracer, new_id
 
 __all__ = [
@@ -72,7 +73,7 @@ class MLJunction:
         app_id: str | None = None,
         app_name: str | None = None,
         environment: str = "production",
-        capture_content: bool = False,
+        capture_content: bool | None = None,
         export_inflight: bool = False,
         tracer: MLJunctionTracer | None = None,
     ) -> None:
@@ -85,9 +86,14 @@ class MLJunction:
             app_id=app_id,
             app_name=app_name,
             environment=environment,
-            capture_content=capture_content,
+            capture_content=(
+                autotrace.capture_content_default() if capture_content is None else capture_content
+            ),
             export_inflight=export_inflight,
         )
+        # One tracer per process: the automatic hook now hands out this one,
+        # so runs started with context() are not also exported a second time.
+        autotrace.use_tracer(self.tracer)
 
     # -- root --------------------------------------------------------------
 

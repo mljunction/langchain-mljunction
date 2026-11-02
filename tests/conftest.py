@@ -22,3 +22,18 @@ def vcr_config() -> dict[str, Any]:
     )
     config["before_record_response"] = _sanitize_response
     return config
+
+
+@pytest.fixture(autouse=True)
+def _no_process_tracer(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Keep automatic tracing off unless a test installs a tracer itself.
+
+    Every ChatMLJunction built with a key would otherwise start a real OTLP
+    exporter, and a tracer installed by one test would leak into the next.
+    """
+    from langchain_mljunction import autotrace
+
+    monkeypatch.setenv("MLJUNCTION_TRACING", "false")
+    monkeypatch.setattr(autotrace, "_tracer", None)
+    monkeypatch.setattr(autotrace, "_unavailable", False)
+    yield

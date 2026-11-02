@@ -354,6 +354,7 @@ class RunState:
     span_kind: str
     name: str
     context: dict[str, Any]
+    parent_key: str | None = None
     first_token_monotonic: float | None = None
     stream_chunks: int = 0
     event_count: int = 0
@@ -367,6 +368,19 @@ _CORRELATION_ATTRIBUTES = {
     "session_id": "mlj.session.id",
     "task_id": "mlj.task.id",
 }
+
+# LangGraph stamps these on the metadata of every run inside a node, so an LLM
+# or tool span knows which graph step it belongs to without any setup.
+_GRAPH_ATTRIBUTES = {
+    "langgraph_node": "mlj.graph.node",
+    "langgraph_step": "mlj.graph.step",
+    "langgraph_checkpoint_ns": "mlj.graph.checkpoint_ns",
+}
+
+# LangChain and LangGraph tag their plumbing runs (channel writes, routing
+# branches) with this. LangSmith hides them; so do we, and their children
+# attach to the nearest visible ancestor instead.
+_HIDDEN_TAG = "langsmith:hidden"
 
 # Invocation settings that describe HOW a model was called, never WHAT was
 # said. Exported always; the rest (metadata, context, output schemas, tools,
@@ -500,6 +514,8 @@ class MLJunctionTracer(BaseCallbackHandler):
         self._otel_context = otel_context
         self._tracer = provider.get_tracer("langchain-mljunction", "0.1.0")
         self._runs: dict[str, RunState] = {}
+        # Hidden run id -> its parent's run id, so children skip over it.
+        self._hidden: dict[str, str | None] = {}
         self._lock = threading.RLock()
 
     def close(self) -> None:
@@ -579,8 +595,15 @@ class MLJunctionTracer(BaseCallbackHandler):
         started_monotonic = time.monotonic()
 
         with self._lock:
+            while parent_key in self._hidden:
+                parent_key = self._hidden[parent_key]
+            if _HIDDEN_TAG in (tags or ()):
+                self._hidden[run_key] = parent_key
+                return
             parent = self._runs.get(parent_key) if parent_key else None
             context = self._context(metadata)
+            if context.get("session_id"):
+                self._adopt_session(parent_key, context["session_id"])
             # A span with no known parent starts its own trace. That is also
             # what happens when a subagent is invoked without the active
             # config - the tree silently splits in two. See child_agent_config.
@@ -624,6 +647,11 @@ class MLJunctionTracer(BaseCallbackHandler):
                     for key, value in context.items()
                     if key in _CORRELATION_ATTRIBUTES and value is not None
                 },
+                **{
+                    target: (metadata or {}).get(source)
+                    for source, target in _GRAPH_ATTRIBUTES.items()
+                    if (metadata or {}).get(source) not in (None, "")
+                },
             }
             for key, value in (attributes or {}).items():
                 initial_attributes[f"mlj.attribute.{key}"] = value
@@ -653,9 +681,24 @@ class MLJunctionTracer(BaseCallbackHandler):
                 span_kind=effective_kind,
                 name=name,
                 context=context,
+                parent_key=parent_key,
                 attributes=dict(attributes or {}),
             )
             self._runs[run_key] = state
+
+    def _adopt_session(self, run_key: str | None, session_id: str) -> None:
+        """Give still-open ancestors the session a descendant learned.
+
+        Without explicit metadata only the model call knows its session (it is
+        a ChatMLJunction setting). The graph, node and tool spans around it
+        start first, so they learn it here and export it when they end, which
+        is what puts the whole tree on the session page.
+        """
+        while run_key and (state := self._runs.get(run_key)):
+            if state.context.get("session_id"):
+                return
+            state.context["session_id"] = session_id
+            run_key = state.parent_key
 
     def _finish(
         self,
@@ -666,13 +709,20 @@ class MLJunctionTracer(BaseCallbackHandler):
     ) -> None:
         span_id = str(run_id)
         with self._lock:
+            self._hidden.pop(span_id, None)
             state = self._runs.pop(span_id, None)
+            if state is not None and (session_id := (attributes or {}).get("session_id")):
+                if not state.context.get("session_id"):
+                    state.context["session_id"] = session_id
+                self._adopt_session(state.parent_key, session_id)
         if state is None:
             return
 
         span = state.span
         if self._export_inflight:
             span.set_attribute("mlj.in_flight", False)
+        if state.context.get("session_id"):
+            span.set_attribute("mlj.session.id", str(state.context["session_id"]))
         span.set_attribute("mlj.stream_chunks", state.stream_chunks)
         if state.first_token_monotonic is not None:
             span.set_attribute(
@@ -696,6 +746,7 @@ class MLJunctionTracer(BaseCallbackHandler):
     def _error(self, *, run_id: UUID, error: BaseException) -> None:
         span_id = str(run_id)
         with self._lock:
+            self._hidden.pop(span_id, None)
             state = self._runs.pop(span_id, None)
         if state is None:
             return
@@ -703,6 +754,8 @@ class MLJunctionTracer(BaseCallbackHandler):
         span = state.span
         if self._export_inflight:
             span.set_attribute("mlj.in_flight", False)
+        if state.context.get("session_id"):
+            span.set_attribute("mlj.session.id", str(state.context["session_id"]))
         from opentelemetry.trace import Status, StatusCode
 
         description = (
@@ -766,7 +819,7 @@ class MLJunctionTracer(BaseCallbackHandler):
             if model.get("finish_reason"):
                 span.set_attribute("gen_ai.response.finish_reasons", [str(model["finish_reason"])])
         for key, value in attributes.items():
-            if key in {"usage", "model", "request_id"}:
+            if key in {"usage", "model", "request_id", "session_id"}:
                 continue
             converted = _attribute(value)
             if converted is not None:
@@ -820,6 +873,11 @@ class MLJunctionTracer(BaseCallbackHandler):
             if self.capture_content
             else {k: v for k, v in invocation.items() if k in _OPERATIONAL_INVOCATION_KEYS}
         )
+        # ChatMLJunction carries its session as a model setting; lift it into
+        # the span context so it reaches the surrounding graph spans too.
+        session_id = invocation.get("session_id")
+        if session_id and not (metadata or {}).get(f"{NS}.session_id"):
+            metadata = {**(metadata or {}), f"{NS}.session_id": session_id}
         self._start(
             run_id=run_id,
             parent_run_id=parent_run_id,
@@ -866,6 +924,8 @@ class MLJunctionTracer(BaseCallbackHandler):
         attributes: dict[str, Any] = {"usage": usage, "model": model}
         if request_id := model.get("request_id"):
             attributes["request_id"] = request_id
+        if session_id := model.get("session_id"):
+            attributes["session_id"] = session_id
         self._finish(run_id=run_id, output=generations, attributes=attributes)
 
     def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:

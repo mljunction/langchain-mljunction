@@ -467,7 +467,16 @@ def test_two_tracers_are_isolated_and_close_independently():
         second.close()
 
 
-def test_facade_does_not_capture_content_by_default():
+def test_facade_captures_content_by_default_like_langsmith():
+    telemetry = MLJunction(api_key="mlj_test", base_url="http://localhost:8001")
+    try:
+        assert telemetry.tracer.capture_content is True
+    finally:
+        telemetry.close()
+
+
+def test_facade_content_capture_can_be_switched_off_by_env(monkeypatch):
+    monkeypatch.setenv("MLJUNCTION_TRACING_CAPTURE_CONTENT", "false")
     telemetry = MLJunction(api_key="mlj_test", base_url="http://localhost:8001")
     try:
         assert telemetry.tracer.capture_content is False

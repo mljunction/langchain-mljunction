@@ -20,12 +20,6 @@ cd langchain-mljunction
 pip install -e ".[test]"
 ```
 
-Agent tracing uses the optional OpenTelemetry transport:
-
-```bash
-pip install "langchain-mljunction[otel]"
-```
-
 Set `MLJUNCTION_API_KEY` and optionally `MLJUNCTION_BASE_URL`, or pass both to the constructor.
 The default base URL is `https://api.mljunction.com`. Point `MLJUNCTION_BASE_URL` at
 `http://localhost:8001` to use a local ML Junction server instead.
@@ -201,6 +195,35 @@ embeddings = MLJunctionEmbeddings(
 vectors = embeddings.embed_documents(["route", "receipt", "reasoning"])
 ```
 
+## Automatic tracing
+
+Tracing is on by default, the way `LANGCHAIN_TRACING_V2` works for LangSmith.
+The first `ChatMLJunction` built in a process (or `MLJUNCTION_API_KEY` in the
+environment) supplies the credentials. From then on every chain, LangGraph node,
+tool and model call is recorded as a span, with no `callbacks=` anywhere. Each
+span carries its inputs and outputs, tokens, latency, and the LangGraph node
+and step it ran in. LangGraph's internal plumbing runs are hidden.
+
+Plain Python functions become spans with `@traceable`:
+
+```python
+from langchain_mljunction import traceable
+
+@traceable
+def plan_day(city: str) -> str:
+    return llm.invoke(f"Plan a day in {city}").content  # nests under plan_day
+```
+
+| Switch | Effect |
+| --- | --- |
+| `MLJUNCTION_TRACING=false` | No automatic tracing in this process |
+| `MLJUNCTION_TRACING_CAPTURE_CONTENT=false` | Keep structure, timings and tokens; drop inputs and outputs |
+| `ChatMLJunction(tracing=False)` / `tracing=True` | Opt this model out, or in despite the env switch |
+| `with tracing_disabled():` | Skip tracing for one block |
+
+Spans join the session page through the model's `session_id`: the graph and
+node spans around a call pick it up from that call.
+
 ## OpenTelemetry agent tracing
 
 ```python
@@ -220,8 +243,10 @@ The callback bridge emits standard OTLP spans to `/v1/traces` from its own
 OpenTelemetry provider. It never touches the global provider, so the rest of
 your application's spans are not sent to ML Junction. For dual export, build
 `MLJunctionTracer(..., tracer_provider=your_provider)` and pass it as
-`MLJunction(tracer=...)`. Inputs, outputs and error details are left off spans
-unless you set `capture_content=True`.
+`MLJunction(tracer=...)`. Inputs, outputs and error details are captured unless
+you pass `capture_content=False` or set `MLJUNCTION_TRACING_CAPTURE_CONTENT=false`.
+Building `MLJunction` also makes its tracer the one automatic tracing uses, so
+runs are never exported twice.
 Set `export_inflight=True` only when debugging hung agents; it emits an extra
 start snapshot for each span and is off by default.
 

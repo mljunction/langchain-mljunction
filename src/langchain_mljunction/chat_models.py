@@ -31,6 +31,7 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_core.utils.pydantic import is_basemodel_subclass
 from pydantic import ConfigDict, Field, PrivateAttr, SecretStr
 
+from langchain_mljunction import autotrace
 from langchain_mljunction._client import (
     MLJunctionClient,
     MLJunctionStreamError,
@@ -514,6 +515,9 @@ class ChatMLJunction(BaseChatModel):
     # Accept OpenRouter-style "provider/model" names by sending only "model".
     # Off by default: a name with a slash is otherwise passed through untouched.
     strip_provider_prefix: bool = False
+    # None follows MLJUNCTION_TRACING (on unless set to false). The first model
+    # built supplies the credentials for process-wide tracing; see autotrace.
+    tracing: bool | None = None
     _client: MLJunctionClient = PrivateAttr()
 
     def model_post_init(self, __context: Any) -> None:
@@ -525,6 +529,13 @@ class ChatMLJunction(BaseChatModel):
             timeout=self.timeout,
             app_name=self.app_name,
         )
+        if self.tracing is not False:
+            autotrace.get_tracer(
+                api_key=self.api_key.get_secret_value(),
+                base_url=self.base_url,
+                app_name=self.app_name,
+                force=self.tracing is True,
+            )
 
     @property
     def _llm_type(self) -> str:
