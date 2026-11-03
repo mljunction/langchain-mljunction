@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import AsyncIterator, Iterator, Sequence
 from operator import itemgetter
 from typing import Any
@@ -282,8 +283,32 @@ def _ai_message(body: dict[str, Any]) -> AIMessage:
             "task_name": body.get("task_name"),
             "app_name": body.get("app_name"),
             "reasoning": reasoning,
+            # The server tools the gateway ran for this answer (web search,
+            # calculator...): each call, its result and its cost.
+            "server_tools": body.get("server_tools"),
         },
     )
+
+
+_SERVER_TOOL_TYPE = re.compile(r"^[a-z][a-z0-9_]{0,59}$")
+
+
+def _format_tool(tool: dict[str, Any] | type | BaseTool, *, strict: bool | None) -> dict[str, Any]:
+    """One entry of ``tools``.
+
+    A server tool (``{"type": "web_search"}``, ``{"type": "calculator"}``) is
+    run by ML Junction, not by your code, and is sent exactly as given with its
+    options. Everything else is a function the model may call and you run.
+    """
+    if (
+        isinstance(tool, dict)
+        and isinstance(tool.get("type"), str)
+        and tool["type"] != "function"
+        and _SERVER_TOOL_TYPE.match(tool["type"])
+        and "function" not in tool
+    ):
+        return dict(tool)
+    return convert_to_openai_tool(tool, strict=strict)
 
 
 def _latest_continuation_token(messages: list[BaseMessage]) -> str | None:
@@ -404,7 +429,10 @@ class _StreamState:
             if not complete.response_metadata.get("model_name"):
                 complete.response_metadata["model"] = self.model_name
                 complete.response_metadata["model_name"] = self.model_name
-            message = _ai_message_chunk(complete, include_output=False)
+            # A request with server tools is not token-streamed: the answer
+            # arrives whole here, so it is taken from this frame when no
+            # delta carried it. Otherwise the deltas already hold it.
+            message = _ai_message_chunk(complete, include_output=not self.saw_output)
         else:
             return None
         return ChatGenerationChunk(message=message)
@@ -792,12 +820,17 @@ class ChatMLJunction(BaseChatModel):
         parallel_tool_calls: bool | None = None,
         **kwargs: Any,
     ) -> Runnable:
-        formatted = [convert_to_openai_tool(tool, strict=strict) for tool in tools]
+        formatted = [_format_tool(tool, strict=strict) for tool in tools]
         if tool_choice is False:
             tool_choice = "none"
         if tool_choice is True:
             if len(formatted) != 1:
                 raise ValueError("tool_choice=True requires exactly one tool")
+            if "function" not in formatted[0]:
+                raise ValueError(
+                    "tool_choice=True needs a function tool; a server tool is called when the "
+                    "model decides it needs it"
+                )
             tool_choice = formatted[0]["function"]["name"]
         if tool_choice == "any":
             tool_choice = "required"

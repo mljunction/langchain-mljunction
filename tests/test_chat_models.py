@@ -654,3 +654,125 @@ def test_idempotency_key_keeps_a_plain_post_so_replay_protection_holds(where: st
     assert model.invoke("Hi", **call_kwargs).content == "ok"
     assert sent["stream"] is False
     assert sent["idempotency_key"] == "ticket-1"
+
+
+# ---- server tools ------------------------------------------------------------------
+
+SERVER_TOOLS_REPORT = {
+    "calls": [
+        {
+            "id": "s1",
+            "tool": "web_search",
+            "round": 1,
+            "status": "succeeded",
+            "error": None,
+            "input": {"query": "repo rate"},
+            "output": {"sources": [{"title": "RBI", "url": "https://rbi.org.in/", "age": None}]},
+            "charged": True,
+            "cost_usd": 0.008,
+        }
+    ],
+    "rounds": 1,
+    "units": {"web_search": 1},
+    "cost_usd": 0.008,
+}
+
+
+def test_server_tools_are_sent_as_given_beside_your_functions() -> None:
+    def lookup(order_id: str) -> str:
+        """Look up an order."""
+        return order_id
+
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+    bound = model.bind_tools(
+        [
+            lookup,
+            {"type": "web_search", "max_results": 3},
+            {"type": "calculator"},
+            {"type": "datetime"},
+        ]
+    )
+    tools = bound.kwargs["tools"]
+    assert tools[0]["type"] == "function" and tools[0]["function"]["name"] == "lookup"
+    assert tools[1:] == [
+        {"type": "web_search", "max_results": 3},
+        {"type": "calculator"},
+        {"type": "datetime"},
+    ]
+
+
+def test_a_server_tool_cannot_be_forced() -> None:
+    model = ChatMLJunction(model="test-model", api_key="test-key")
+    with pytest.raises(ValueError, match="function tool"):
+        model.bind_tools([{"type": "calculator"}], tool_choice=True)
+
+
+def test_an_answer_that_used_server_tools_arrives_whole_and_reports_the_calls() -> None:
+    # A server-tool stream has no text deltas: progress events, then the
+    # whole answer on response.completed.
+    model = _buffered_model(
+        [
+            ("response.server_tool_call.in_progress", {"id": "s1", "tool": "web_search"}),
+            ("response.server_tool_call.completed", SERVER_TOOLS_REPORT["calls"][0]),
+            ("response.created", {"id": "resp_1"}),
+            (
+                "response.completed",
+                {
+                    "id": "resp_1",
+                    "model": "test-model",
+                    "finish_reason": "stop",
+                    "output": [{"type": "text", "text": "It is 5.5% (rbi.org.in)."}],
+                    "server_tools": SERVER_TOOLS_REPORT,
+                },
+            ),
+        ]
+    )
+    message = model.invoke("Repo rate?")
+    assert message.content == "It is 5.5% (rbi.org.in)."
+    assert message.response_metadata["server_tools"] == SERVER_TOOLS_REPORT
+
+
+def test_a_server_tool_turn_can_hand_back_your_function_calls() -> None:
+    # The model searched and called your function in parallel: you get the
+    # function call; the search results wait at the gateway for your reply.
+    model = _buffered_model(
+        [
+            ("response.server_tool_call.completed", SERVER_TOOLS_REPORT["calls"][0]),
+            (
+                "response.completed",
+                {
+                    "id": "resp_1",
+                    "model": "test-model",
+                    "finish_reason": "tool_calls",
+                    "output": [
+                        {
+                            "type": "tool_call",
+                            "tool_call": {
+                                "id": "f1",
+                                "type": "function",
+                                "function": {"name": "lookup", "arguments": '{"order_id": "7"}'},
+                            },
+                        }
+                    ],
+                    "warnings": [{"code": "tool.held_for_functions"}],
+                    "server_tools": SERVER_TOOLS_REPORT,
+                },
+            ),
+        ]
+    )
+    message = model.invoke("Where is order 7, and what is the repo rate?")
+    assert [call["name"] for call in message.tool_calls] == ["lookup"]
+    assert message.tool_calls[0]["args"] == {"order_id": "7"}
+
+
+def test_a_token_streamed_answer_is_not_doubled_by_the_closing_frame() -> None:
+    model = _buffered_model(
+        [
+            ("response.output_text.delta", {"delta": "hi"}),
+            (
+                "response.completed",
+                {"id": "r", "model": "m", "output": [{"type": "text", "text": "hi"}]},
+            ),
+        ]
+    )
+    assert model.invoke("x").content == "hi"

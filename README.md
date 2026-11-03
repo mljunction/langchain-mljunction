@@ -158,6 +158,30 @@ structured-output method, so a LangChain parser never sees partial JSON. Ordinar
 `raw`, `parsed`, and `parsing_error`. The complete unparsed `AIMessage` is available under `raw`;
 read its `content` for native JSON Schema/JSON mode or `tool_calls` for function-calling.
 
+## Server tools
+
+ML Junction can run tools for the model while it answers: web search, an exact calculator, and
+date & time. Bind them beside your own tools; ML Junction runs them inside the request.
+
+```python
+agent = llm.bind_tools([
+    lookup_customer,                          # yours: you run it
+    {"type": "web_search", "max_results": 5}, # ML Junction runs it
+    {"type": "calculator"},
+    {"type": "datetime"},
+])
+
+reply = agent.invoke("Check account 42 and find today's USD to INR rate")
+for call in reply.tool_calls:   # only your own tools ever appear here
+    ...
+print(reply.response_metadata["server_tools"])  # each call: input, sources/result, cost
+```
+
+`tool_calls` never contains a server tool, so an ordinary agent loop needs no special case. When
+the model calls a server tool and your functions in the same turn, the server call runs at once
+and its result is given back to the model when you send your function results. Prices, limits and
+uptime are on [mljunction.com/tools](https://mljunction.com/tools).
+
 ## Sync, async, batch, and per-call overrides
 
 ```python
