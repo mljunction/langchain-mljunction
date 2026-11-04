@@ -308,7 +308,12 @@ def _format_tool(tool: dict[str, Any] | type | BaseTool, *, strict: bool | None)
         and "function" not in tool
     ):
         return dict(tool)
-    return convert_to_openai_tool(tool, strict=strict)
+    formatted = convert_to_openai_tool(tool, strict=strict)
+    # LangChain rebuilds the dict and drops what it does not know, which would
+    # quietly send a tool the caller held back from the prompt.
+    if isinstance(tool, dict) and tool.get("defer_loading"):
+        formatted["defer_loading"] = True
+    return formatted
 
 
 def _latest_continuation_token(messages: list[BaseMessage]) -> str | None:
