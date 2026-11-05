@@ -518,3 +518,44 @@ def test_run_ending_in_its_own_context_restores_the_parent(tracer, exporter):
     assert trace.get_current_span() is not before
     tracer.on_chain_end({}, run_id=run_id)
     assert trace.get_current_span() is before
+
+
+class _RefusingExporter(SpanExporter):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def export(self, spans: Any) -> SpanExportResult:
+        self.calls += 1
+        if self.calls == 3:
+            raise RuntimeError("exporter bug")
+        return SpanExportResult.FAILURE if self.calls < 4 else SpanExportResult.SUCCESS
+
+    def shutdown(self) -> None:
+        pass
+
+
+def test_a_refused_export_logs_one_actionable_warning_and_never_raises(caplog):
+    import logging
+
+    exporter = _RefusingExporter()
+    instance = MLJunctionTracer(
+        endpoint="http://localhost:8001",
+        api_key="mlj_bad",
+        app_id="test-app",
+        span_exporter=exporter,
+        tracer_provider=TracerProvider(),
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="langchain_mljunction.tracing"):
+            for _ in range(4):
+                run_id = uid()
+                instance.on_chain_start({"name": "graph"}, {}, run_id=run_id)
+                instance.on_chain_end({}, run_id=run_id)
+                instance.flush()
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1, "one line per failure streak, not one per batch"
+        assert "MLJUNCTION_API_KEY" in warnings[0].getMessage()
+        assert "Model calls are not affected" in warnings[0].getMessage()
+        assert any("recovered" in r.getMessage() for r in caplog.records)
+    finally:
+        instance.close()

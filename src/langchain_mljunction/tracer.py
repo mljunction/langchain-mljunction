@@ -21,6 +21,7 @@ a dead endpoint costs a log line rather than a raised exception.
 from __future__ import annotations
 
 import contextlib
+import logging
 import dataclasses
 import itertools
 import json
@@ -287,6 +288,60 @@ def extract_llm_result(
     return generations_payload, combined_usage, model_data
 
 
+_export_logger = logging.getLogger("langchain_mljunction.tracing")
+
+
+class _ExportGuard:
+    """Wraps the span exporter so a failed export is one clear, actionable line.
+
+    OpenTelemetry reports a rejected batch as "Failed to export span batch
+    code: 401" on its own logger, which reads like a failed model call and says
+    nothing about what to change. Tracing never affects inference: the batch is
+    dropped and the call that produced it already returned. This says so once
+    per failure streak, under langchain_mljunction.tracing, and never raises.
+    """
+
+    def __init__(self, inner: Any, endpoint: str) -> None:
+        self._inner = inner
+        self._endpoint = endpoint
+        self._failing = False
+
+    def export(self, spans: Any) -> Any:
+        from opentelemetry.sdk.trace.export import SpanExportResult
+
+        try:
+            result = self._inner.export(spans)
+        except Exception:  # noqa: BLE001 - telemetry must never break the caller
+            result = SpanExportResult.FAILURE
+        if result == SpanExportResult.SUCCESS:
+            if self._failing:
+                _export_logger.info("ML Junction trace export recovered (%s)", self._endpoint)
+            self._failing = False
+        elif not self._failing:
+            self._failing = True
+            _export_logger.warning(
+                "ML Junction trace export failed for %s; these spans were dropped. "
+                "Model calls are not affected. Check that MLJUNCTION_API_KEY is valid for "
+                "this endpoint (a 401/403 above means it was refused), or set "
+                "MLJUNCTION_TRACING=false to stop exporting.",
+                self._endpoint,
+            )
+        return result
+
+    def shutdown(self) -> None:
+        try:
+            self._inner.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        flush = getattr(self._inner, "force_flush", None)
+        try:
+            return bool(flush(timeout_millis)) if flush else True
+        except Exception:  # noqa: BLE001
+            return False
+
+
 class _ManagedSpanProcessor:
     """A closable processor safe to leave attached to a caller-supplied provider."""
 
@@ -476,10 +531,11 @@ class MLJunctionTracer(BaseCallbackHandler):
         headers = {"Authorization": f"Bearer {api_key}"}
         if app_id:
             headers["X-App"] = app_id
-        exporter = span_exporter or OTLPSpanExporter(
-            endpoint=endpoint.rstrip("/") + "/v1/traces",
-            headers=headers,
-            timeout=10,
+        traces_url = endpoint.rstrip("/") + "/v1/traces"
+        exporter = _ExportGuard(
+            span_exporter
+            or OTLPSpanExporter(endpoint=traces_url, headers=headers, timeout=10),
+            traces_url,
         )
         processor = _ManagedSpanProcessor(
             BatchSpanProcessor(
@@ -509,10 +565,10 @@ class MLJunctionTracer(BaseCallbackHandler):
         provider.add_span_processor(processor)
         inflight_processor = None
         if export_inflight:
-            inflight_exporter = span_exporter or OTLPSpanExporter(
-                endpoint=endpoint.rstrip("/") + "/v1/traces",
-                headers=headers,
-                timeout=10,
+            inflight_exporter = _ExportGuard(
+                span_exporter
+                or OTLPSpanExporter(endpoint=traces_url, headers=headers, timeout=10),
+                traces_url,
             )
             inflight_processor = _StartSnapshotProcessor(
                 BatchSpanProcessor(
