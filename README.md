@@ -222,8 +222,10 @@ vectors = embeddings.embed_documents(["route", "receipt", "reasoning"])
 ## Automatic tracing
 
 Tracing is on by default, the way `LANGCHAIN_TRACING_V2` works for LangSmith.
-The first `ChatMLJunction` built in a process (or `MLJUNCTION_API_KEY` in the
-environment) supplies the credentials. From then on every chain, LangGraph node,
+The first `ChatMLJunction` built in a process supplies the credentials. An
+`MLJUNCTION_API_KEY` in the environment alone does not start tracing, so
+LangChain runs on other providers stay out of ML Junction unless you set
+`MLJUNCTION_TRACING=true`. From then on every chain, LangGraph node,
 tool and model call is recorded as a span, with no `callbacks=` anywhere. Each
 span carries its inputs and outputs, tokens, latency, and the LangGraph node
 and step it ran in. LangGraph's internal plumbing runs are hidden.
@@ -241,6 +243,7 @@ def plan_day(city: str) -> str:
 | Switch | Effect |
 | --- | --- |
 | `MLJUNCTION_TRACING=false` | No automatic tracing in this process |
+| `MLJUNCTION_TRACING=true` | Trace every LangChain run from `MLJUNCTION_API_KEY`, even before a `ChatMLJunction` is built |
 | `MLJUNCTION_TRACING_CAPTURE_CONTENT=false` | Keep structure, timings and tokens; drop inputs and outputs |
 | `ChatMLJunction(tracing=False)` / `tracing=True` | Opt this model out, or in despite the env switch |
 | `with tracing_disabled():` | Skip tracing for one block |

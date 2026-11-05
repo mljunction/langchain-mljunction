@@ -2,10 +2,16 @@
 
 LangSmith traces every LangChain run without code changes because it registers
 a configure hook: whenever LangChain builds a callback manager, the hook adds
-its tracer. This module does the same for ML Junction. The first ChatMLJunction
-built in the process (or MLJUNCTION_API_KEY in the environment) supplies the
-credentials, and from then on every chain, LangGraph node, tool and model call
-becomes a span without anyone passing `callbacks=`.
+its tracer. This module does the same for ML Junction. The first ML Junction
+component built in the process supplies the credentials, and from then on every
+chain, LangGraph node, tool and model call becomes a span without anyone
+passing `callbacks=`.
+
+An ML Junction key in the environment is not consent on its own: an app that
+keeps the key for one feature while its LangChain models run on another
+provider must not start sending those runs to ML Junction just because this
+package was imported. MLJUNCTION_TRACING=true opts the whole process in from
+the environment key alone.
 
 Switches:
 
@@ -50,6 +56,11 @@ def _env_flag(name: str, default: bool) -> bool:
 def tracing_enabled() -> bool:
     """Whether automatic tracing is switched on for this process."""
     return _env_flag("MLJUNCTION_TRACING", True)
+
+
+def _explicitly_enabled() -> bool:
+    raw = os.getenv("MLJUNCTION_TRACING")
+    return raw is not None and raw.strip().lower() not in _FALSE
 
 
 def capture_content_default() -> bool:
@@ -140,7 +151,12 @@ class _ProcessSlot:
     def get(self) -> Any | None:
         if _disabled.get():
             return None
-        return _tracer if _tracer is not None else get_tracer()
+        if _tracer is not None:
+            return _tracer
+        # Only an explicit MLJUNCTION_TRACING=true lets the hook start tracing
+        # from the environment key; otherwise an ML Junction component must have
+        # been built first (see the module docstring).
+        return get_tracer() if _explicitly_enabled() else None
 
 
 register_configure_hook(_ProcessSlot(), inheritable=True)  # type: ignore[arg-type]

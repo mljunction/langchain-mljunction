@@ -171,3 +171,26 @@ def test_model_tracing_flag_overrides_the_env_switch(monkeypatch):
     ChatMLJunction(model="m", api_key="mlj_test", base_url="http://gw", tracing=True)
     assert built and built[0]["endpoint"] == "http://gw"
     assert built[0]["capture_content"] is True
+
+
+def test_env_key_alone_does_not_trace_other_providers(monkeypatch):
+    """A key kept for one feature must not trace runs of other providers."""
+    monkeypatch.delenv("MLJUNCTION_TRACING", raising=False)
+    monkeypatch.setenv("MLJUNCTION_API_KEY", "mlj_test")
+    assert autotrace._ProcessSlot().get() is None
+    assert autotrace._tracer is None
+
+
+def test_explicit_env_switch_traces_from_the_env_key(monkeypatch):
+    monkeypatch.setenv("MLJUNCTION_TRACING", "true")
+    monkeypatch.setenv("MLJUNCTION_API_KEY", "mlj_test")
+    monkeypatch.setattr(autotrace.atexit, "register", lambda *a: None)
+    built: list[dict[str, Any]] = []
+
+    class Stub:
+        def __init__(self, **kwargs: Any) -> None:
+            built.append(kwargs)
+
+    monkeypatch.setattr("langchain_mljunction.tracer.MLJunctionTracer", Stub)
+    assert isinstance(autotrace._ProcessSlot().get(), Stub)
+    assert built[0]["api_key"] == "mlj_test"

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import weakref
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
@@ -100,10 +102,29 @@ class MLJunctionClient:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         if app_name:
             headers["X-App"] = app_name
-        self.sync = httpx.Client(base_url=base_url.rstrip("/"), headers=headers, timeout=timeout)
-        self.async_ = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"), headers=headers, timeout=timeout
-        )
+        self._base_url = base_url.rstrip("/")
+        self._headers = headers
+        self._timeout = timeout
+        self.sync = httpx.Client(base_url=self._base_url, headers=headers, timeout=timeout)
+        # An httpx.AsyncClient's pooled connections belong to the event loop that
+        # opened them. Callers cache chat models across loops (one asyncio.run per
+        # script step, per test, per worker thread), and reusing a pool from a
+        # finished loop fails with "Event loop is closed". Keep one pool per loop.
+        self._async_clients: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, httpx.AsyncClient
+        ] = weakref.WeakKeyDictionary()
+
+    @property
+    def async_(self) -> httpx.AsyncClient:
+        """The async client owned by the running event loop, created on first use."""
+        loop = asyncio.get_running_loop()
+        client = self._async_clients.get(loop)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(
+                base_url=self._base_url, headers=self._headers, timeout=self._timeout
+            )
+            self._async_clients[loop] = client
+        return client
 
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         response = self.sync.post(path, json=payload)
@@ -112,7 +133,7 @@ class MLJunctionClient:
 
     async def apost(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         response = await self.async_.post(path, json=payload)
-        _raise_for_status(response)
+        await _araise_for_status(response)
         return response.json()
 
     def put(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -152,7 +173,14 @@ class MLJunctionClient:
         self.sync.close()
 
     async def aclose(self) -> None:
-        await self.async_.aclose()
+        """Close the running loop's pool. Pools of other loops are dropped with them."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        client = self._async_clients.pop(loop, None)
+        if client is not None:
+            await client.aclose()
 
 
 def _parse_sse(lines: Iterator[str]) -> Iterator[tuple[str, dict[str, Any]]]:

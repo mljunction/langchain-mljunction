@@ -482,3 +482,39 @@ def test_facade_content_capture_can_be_switched_off_by_env(monkeypatch):
         assert telemetry.tracer.capture_content is False
     finally:
         telemetry.close()
+
+
+@pytest.mark.parametrize("ending", ["end", "error"])
+def test_run_ending_in_another_context_does_not_log_detach_failure(
+    tracer, exporter, caplog, ending
+):
+    """LangChain may start and end one run in different contexts (a sync
+    callback in an executor thread, a separate asyncio task). OpenTelemetry's
+    detach then logs "Failed to detach context" with a ValueError traceback.
+    The span must still end cleanly, with nothing logged."""
+    import contextvars
+    import logging
+
+    run_id = uid()
+    contextvars.copy_context().run(
+        tracer.on_chain_start, {"name": "graph"}, {}, run_id=run_id
+    )
+    with caplog.at_level(logging.DEBUG):
+        if ending == "end":
+            tracer.on_chain_end({}, run_id=run_id)
+        else:
+            tracer.on_chain_error(RuntimeError("boom"), run_id=run_id)
+
+    assert "Failed to detach context" not in caplog.text
+    assert [span.name for span in exported(tracer, exporter)] == ["graph"]
+
+
+def test_run_ending_in_its_own_context_restores_the_parent(tracer, exporter):
+    from opentelemetry import trace
+
+    before = trace.get_current_span()
+    run_id = uid()
+    tracer.on_chain_start({"name": "graph"}, {}, run_id=run_id)
+    assert trace.get_current_span() is not before
+    tracer.on_chain_end({}, run_id=run_id)
+    assert trace.get_current_span() is before

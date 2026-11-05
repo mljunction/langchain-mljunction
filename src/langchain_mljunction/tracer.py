@@ -344,6 +344,24 @@ def _attribute(value: Any) -> str | bool | int | float | list[str] | None:
     return json.dumps(safe, separators=(",", ":"), ensure_ascii=False)
 
 
+def _detach(token: Any) -> None:
+    """Undo a span attach, quietly when the run ends in another context.
+
+    LangChain may start and end one run in different contexts: a sync callback
+    in an executor thread, or a separate asyncio task. The attach then belongs
+    to a context that is already gone, and OpenTelemetry's ``context.detach``
+    logs "Failed to detach context" with a ValueError traceback on every such
+    run (it catches the error itself, so suppressing it here was never enough).
+    Reset the ContextVar token directly: in the owning context it restores the
+    parent exactly as ``detach`` would; anywhere else there is nothing to undo.
+    """
+    var = getattr(token, "var", None)
+    if var is None:
+        return
+    with contextlib.suppress(ValueError, RuntimeError):
+        var.reset(token)
+
+
 @dataclass
 class RunState:
     """In-flight span. Lives from the start callback to the end/error one."""
@@ -740,8 +758,7 @@ class MLJunctionTracer(BaseCallbackHandler):
 
         span.set_status(Status(StatusCode.OK))
         span.end(end_time=time.time_ns())
-        with contextlib.suppress(ValueError, RuntimeError):
-            self._otel_context.detach(state.context_token)
+        _detach(state.context_token)
 
     def _error(self, *, run_id: UUID, error: BaseException) -> None:
         span_id = str(run_id)
@@ -779,8 +796,7 @@ class MLJunctionTracer(BaseCallbackHandler):
                 or "{}",
             )
         span.end(end_time=time.time_ns())
-        with contextlib.suppress(ValueError, RuntimeError):
-            self._otel_context.detach(state.context_token)
+        _detach(state.context_token)
 
     def _span_event(self, *, run_id: UUID, name: str, data: Any) -> None:
         """Record something that happened inside a span but has no duration."""
